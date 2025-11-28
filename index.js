@@ -1,30 +1,108 @@
 import express from "express";
+import dotenv from "dotenv";
+import { AccessToken } from "livekit-server-sdk";
+import { connect } from "@livekit/rtc-node";
+
+dotenv.config();
 
 const app = express();
 app.use(express.json());
 
 const PORT = process.env.PORT || 3000;
 
-// Healthcheck – used to see if the worker is alive
+const LIVEKIT_WS_URL = process.env.LIVEKIT_WS_URL;
+const LIVEKIT_API_KEY = process.env.LIVEKIT_API_KEY;
+const LIVEKIT_API_SECRET = process.env.LIVEKIT_API_SECRET;
+
+if (!LIVEKIT_WS_URL || !LIVEKIT_API_KEY || !LIVEKIT_API_SECRET) {
+  console.warn("⚠️ Missing LiveKit env vars in worker (LIVEKIT_WS_URL / API_KEY / API_SECRET)");
+}
+
+// --- helper: start agent in background for a room ---
+async function startAgentForSession(roomName, agentId) {
+  try {
+    const agentIdentity = `agent_${agentId}_${Date.now()}`;
+
+    // 1) Create agent token
+    const at = new AccessToken(LIVEKIT_API_KEY, LIVEKIT_API_SECRET, {
+      identity: agentIdentity,
+    });
+    at.addGrant({
+      roomJoin: true,
+      room: roomName,
+      canPublish: true,
+      canSubscribe: true,
+    });
+
+    const agentToken = at.toJwt();
+    console.log("🤖 Created agent token for identity:", agentIdentity);
+
+    // 2) Connect agent to LiveKit room
+    const room = await connect(LIVEKIT_WS_URL, agentToken);
+    console.log("🤖 Agent joined room:", roomName);
+
+    // 3) Basic event logging
+    room.on("participantConnected", (participant) => {
+      console.log("👤 Caller joined:", participant.identity);
+    });
+
+    room.on("trackSubscribed", (track, publication, participant) => {
+      console.log(
+        "🎧 Agent subscribed to track:",
+        track.kind,
+        "from",
+        participant.identity,
+      );
+    });
+
+    room.on("disconnected", () => {
+      console.log("👋 Agent disconnected from room:", roomName);
+    });
+
+    // NOTE: we keep the room connection open; Railway will keep process alive
+  } catch (err) {
+    console.error("❌ Error in startAgentForSession:", err);
+  }
+}
+
+// Healthcheck
 app.get("/", (req, res) => {
   res.send("21ai Agent Worker is running ✅");
 });
 
-// This is what Supabase will call
+// Start-session endpoint called by Supabase edge function
 app.post("/start-session", async (req, res) => {
   try {
-    const { livekitUrl, roomName, agentToken, agentConfig } = req.body || {};
+    const { livekitUrl, roomName, agentId, agentConfig } = req.body || {};
 
-    console.log("🔔 New start-session request:");
-    console.log("  livekitUrl:", livekitUrl);
-    console.log("  roomName:", roomName);
-    console.log("  agentId:", agentConfig?.id);
+    console.log("⚡ New start-session request:", {
+      livekitUrl,
+      roomName,
+      agentId,
+    });
 
-    // Later: connect to LiveKit + run STT → LLM → TTS
-    res.json({ ok: true, message: "Worker received session payload" });
+    if (!roomName || !agentId) {
+      return res.status(400).json({
+        ok: false,
+        error: "roomName and agentId are required",
+      });
+    }
+
+    // Fire-and-forget: start agent in the background
+    startAgentForSession(roomName, agentId);
+
+    // Respond back to Supabase / frontend – we don't wait for agent join
+    return res.json({
+      ok: true,
+      roomName,
+      agentId,
+    });
   } catch (err) {
     console.error("❌ Error in /start-session:", err);
-    res.status(500).json({ ok: false, error: "Failed in worker" });
+    return res.status(500).json({
+      ok: false,
+      error: "worker_failed",
+    });
   }
 });
 
