@@ -1,7 +1,7 @@
 import express from "express";
 import dotenv from "dotenv";
 import { AccessToken } from "livekit-server-sdk";
-import { connect } from "@livekit/rtc-node";
+import { Room, RoomEvent, createLocalAudioTrack } from "@livekit/rtc-node";
 
 dotenv.config();
 
@@ -24,18 +24,23 @@ const LIVEKIT_API_KEY = process.env.LIVEKIT_API_KEY;
 const LIVEKIT_API_SECRET = process.env.LIVEKIT_API_SECRET;
 
 if (!LIVEKIT_WS_URL || !LIVEKIT_API_KEY || !LIVEKIT_API_SECRET) {
-  console.warn("⚠️ Missing LiveKit env vars in worker (LIVEKIT_WS_URL / LIVEKIT_API_KEY / LIVEKIT_API_SECRET)");
+  console.warn(
+    "⚠️ Missing LiveKit env vars in worker (LIVEKIT_WS_URL / LIVEKIT_API_KEY / LIVEKIT_API_SECRET)",
+  );
 }
 
-// --- helper: start agent in background for a room ---
-async function startAgentForSession(roomName, agentId) {
+// ------------------------------------------------------------
+// Agent joins the LiveKit room as a server-side participant
+// ------------------------------------------------------------
+async function startAgent(roomName, livekitUrl, agentId) {
   try {
-    const agentIdentity = `agent_${agentId}_${Date.now()}`;
+    const agentIdentity = `agent_${agentId}`;
 
-    // 1) Create agent token
+    // 1) Create agent token using LiveKit Server SDK (v2)
     const at = new AccessToken(LIVEKIT_API_KEY, LIVEKIT_API_SECRET, {
       identity: agentIdentity,
     });
+
     at.addGrant({
       roomJoin: true,
       room: roomName,
@@ -43,19 +48,18 @@ async function startAgentForSession(roomName, agentId) {
       canSubscribe: true,
     });
 
-    const agentToken = at.toJwt();
+    const agentToken = await at.toJwt();
     console.log("🤖 Created agent token for identity:", agentIdentity);
 
-    // 2) Connect agent to LiveKit room
-    const room = await connect(LIVEKIT_WS_URL, agentToken);
-    console.log("🤖 Agent joined room:", roomName);
+    // 2) Connect to LiveKit as the agent
+    const room = new Room();
 
-    // 3) Basic event logging
-    room.on("participantConnected", (participant) => {
-      console.log("👤 Caller joined:", participant.identity);
+    // Debug event logging
+    room.on(RoomEvent.ParticipantConnected, (p) => {
+      console.log("👤 Participant connected:", p.identity);
     });
 
-    room.on("trackSubscribed", (track, publication, participant) => {
+    room.on(RoomEvent.TrackSubscribed, (track, pub, participant) => {
       console.log(
         "🎧 Agent subscribed to track:",
         track.kind,
@@ -64,13 +68,23 @@ async function startAgentForSession(roomName, agentId) {
       );
     });
 
-    room.on("disconnected", () => {
+    room.on(RoomEvent.Error, (err) => {
+      console.error("❌ Room error:", err);
+    });
+
+    room.on(RoomEvent.Disconnected, () => {
       console.log("👋 Agent disconnected from room:", roomName);
     });
 
-    // We keep the room connection open; Railway keeps the process alive
+    await room.connect(livekitUrl || LIVEKIT_WS_URL, agentToken);
+    console.log("🤖 Agent joined room as:", agentIdentity);
+
+    // 3) Publish a silent audio track to keep the agent "present"
+    const silenceTrack = await createLocalAudioTrack({ silence: true });
+    await room.localParticipant.publishTrack(silenceTrack);
+    console.log("🔊 Agent audio track published (silent)");
   } catch (err) {
-    console.error("❌ Error in startAgentForSession:", err);
+    console.error("❌ Failed to connect agent:", err);
   }
 }
 
@@ -84,11 +98,11 @@ app.post("/start-session", async (req, res) => {
   try {
     const { livekitUrl, roomName, agentId, agentConfig } = req.body || {};
 
-    console.log("⚡ New start-session request:", {
-      livekitUrl,
-      roomName,
-      agentId,
-    });
+    console.log("⚡ New start-session request:");
+    console.log("livekitUrl:", livekitUrl);
+    console.log("roomName:", roomName);
+    console.log("agentId:", agentId);
+    console.log("agentConfig:", agentConfig ? "received" : "none");
 
     if (!roomName || !agentId) {
       return res.status(400).json({
@@ -98,9 +112,9 @@ app.post("/start-session", async (req, res) => {
     }
 
     // Fire-and-forget: start agent in the background
-    startAgentForSession(roomName, agentId);
+    startAgent(roomName, livekitUrl || LIVEKIT_WS_URL, agentId);
 
-    // Respond back to Supabase / frontend – we don't wait for agent to fully join
+    // Respond back quickly – frontend already has its own token from Supabase
     return res.json({
       ok: true,
       roomName,
