@@ -1,5 +1,11 @@
-// index.js – 21ai-agent-worker
-// LiveKit rtc-node + ElevenLabs TTS (greeting only)
+// index.js – 21AI Agent Worker (LiveKit + ElevenLabs TTS)
+// -------------------------------------------------------
+// Expects POST /start-session with:
+//   { livekitUrl, roomName, agentId, agentToken }
+//
+// Env vars in Railway:
+//   LIVEKIT_WS_URL      (optional, mainly for logging)
+//   ELEVENLABS_API_KEY  (required for TTS)
 
 import express from "express";
 import dotenv from "dotenv";
@@ -20,23 +26,34 @@ app.use(express.json());
 
 const PORT = process.env.PORT || 3000;
 
-// --- ENV VARS -------------------------------------------------
-
-const LIVEKIT_WS_URL = process.env.LIVEKIT_WS_URL; // fallback if livekitUrl not passed
+// We only *need* ELEVENLABS_API_KEY here. LiveKit URL and token come from Supabase.
+const LIVEKIT_WS_URL = process.env.LIVEKIT_WS_URL || "(provided per-request)";
 const ELEVENLABS_API_KEY = process.env.ELEVENLABS_API_KEY;
 
+// Basic boot logs
 console.log("21AI Agent Worker booted");
-console.log("LIVEKIT_WS_URL:", LIVEKIT_WS_URL ? "✓" : "❌ missing");
-console.log("ELEVENLABS_API_KEY:", ELEVENLABS_API_KEY ? "✓" : "❌ missing");
-console.log("🚀 Worker ready on port", PORT);
+console.log("LIVEKIT_WS_URL (env):", LIVEKIT_WS_URL);
+console.log("ELEVENLABS_API_KEY:", ELEVENLABS_API_KEY ? "✓ set" : "❌ MISSING");
+
+// Global error logging
+process.on("uncaughtException", (err) => {
+  console.error("❌ Uncaught Exception:", err);
+});
+process.on("unhandledRejection", (reason) => {
+  console.error("❌ Unhandled Rejection:", reason);
+});
 
 // -------------------------------------------------------------
-// ElevenLabs TTS → Int16Array (PCM 16k mono)
+// ElevenLabs TTS → PCM 16k mono
 // -------------------------------------------------------------
-async function ttsElevenLabsToInt16(text) {
+const SAMPLE_RATE = 16000;
+const NUM_CHANNELS = 1;
+
+// Call ElevenLabs and get raw PCM 16k audio buffer
+async function ttsElevenLabs(text) {
   try {
     if (!ELEVENLABS_API_KEY) {
-      console.error("❌ ELEVENLABS_API_KEY missing");
+      console.error("❌ ELEVENLABS_API_KEY is not set");
       return null;
     }
 
@@ -57,27 +74,23 @@ async function ttsElevenLabsToInt16(text) {
             stability: 0.4,
             similarity_boost: 0.8,
           },
-          // 16kHz mono raw PCM, required for rtc-node AudioSource(16000, 1)
+          // IMPORTANT: 16k mono PCM
           output_format: "pcm_16000",
         }),
       }
     );
 
     if (!res.ok) {
-      console.error("❌ ElevenLabs TTS error:", await res.text());
+      const errText = await res.text();
+      console.error("❌ ElevenLabs TTS error response:", errText);
       return null;
     }
 
-    const uint8 = new Uint8Array(await res.arrayBuffer());
-    // IMPORTANT: use subarray (not slice) when converting
-    const int16 = new Int16Array(
-      uint8.buffer,
-      uint8.byteOffset,
-      uint8.byteLength / 2
-    );
+    const arrayBuf = await res.arrayBuffer();
+    const buffer = Buffer.from(arrayBuf);
+    console.log("🎧 ElevenLabs PCM bytes:", buffer.length);
 
-    console.log("🎧 ElevenLabs PCM samples:", int16.length);
-    return int16;
+    return buffer;
   } catch (err) {
     console.error("❌ ElevenLabs request failed:", err);
     return null;
@@ -85,52 +98,94 @@ async function ttsElevenLabsToInt16(text) {
 }
 
 // -------------------------------------------------------------
-// Agent joins room & plays greeting
+// Stream PCM to LiveKit in small frames (to avoid crackling)
+// -------------------------------------------------------------
+//
+// We split the PCM into 20ms chunks:
+//   16,000 samples/sec * 0.02s = 320 samples per frame (per channel)
+// Each sample is Int16 (2 bytes), mono.
+
+const FRAME_DURATION_MS = 20;
+const SAMPLES_PER_FRAME = Math.floor(
+  (SAMPLE_RATE * FRAME_DURATION_MS) / 1000
+);
+
+// Push PCM buffer into LiveKit AudioSource as sequential frames
+async function playPcmAsFrames(audioSource, pcmBuffer) {
+  if (!pcmBuffer || pcmBuffer.length === 0) {
+    console.warn("⚠ playPcmAsFrames called with empty buffer");
+    return;
+  }
+
+  // total samples (mono) = bytes / 2
+  const totalSamples = Math.floor(pcmBuffer.length / 2);
+  const pcmView = new Int16Array(
+    pcmBuffer.buffer,
+    pcmBuffer.byteOffset,
+    totalSamples
+  );
+
+  console.log("🎧 PCM total samples:", totalSamples);
+  console.log("🎧 Using frame size (samples):", SAMPLES_PER_FRAME);
+
+  let offset = 0;
+
+  while (offset < totalSamples) {
+    const remaining = totalSamples - offset;
+    const frameSamples = Math.min(SAMPLES_PER_FRAME, remaining);
+
+    // Create AudioFrame with sampleRate, channels, and samples per channel
+    const frame = new AudioFrame(SAMPLE_RATE, NUM_CHANNELS, frameSamples);
+    const frameView = new Int16Array(frame.data.buffer);
+
+    // Copy this chunk
+    for (let i = 0; i < frameSamples; i++) {
+      frameView[i] = pcmView[offset + i];
+    }
+
+    // Send frame to LiveKit
+    await audioSource.captureFrame(frame);
+
+    offset += frameSamples;
+  }
+
+  console.log("📤 Finished streaming PCM frames to LiveKit");
+}
+
+// -------------------------------------------------------------
+// Agent: join room + speak greeting once
 // -------------------------------------------------------------
 async function startAgent({ livekitUrl, roomName, agentId, agentToken }) {
   try {
-    const url = livekitUrl || LIVEKIT_WS_URL;
-    if (!url) {
-      throw new Error("No LiveKit URL provided");
-    }
-    if (!agentToken) {
-      throw new Error("No agentToken provided");
-    }
+    const identity = `agent_${agentId}_${Date.now()}`;
 
-    const identity = `agent_${agentId || "unknown"}_${Date.now()}`;
     console.log("🤖 startAgent -> room:", roomName);
     console.log("🤖 startAgent -> identity:", identity);
-    console.log("🤖 startAgent -> url:", url);
+    console.log("🤖 startAgent -> url:", livekitUrl);
 
     const room = new Room();
 
-    // Basic event logs
-    room
-      .on(RoomEvent.ParticipantConnected, (p) => {
-        console.log("👤 Participant connected:", p.identity);
-      })
-      .on(RoomEvent.TrackSubscribed, (track, pub, participant) => {
-        console.log(
-          "🎧 Track subscribed:",
-          track.kind,
-          "from",
-          participant.identity
-        );
-      })
-      .on(RoomEvent.Disconnected, () => {
-        console.log("👋 Agent disconnected from room:", roomName);
-      });
-
-    // 1) Connect using the token created in the Supabase edge function
-    await room.connect(url, agentToken, {
-      autoSubscribe: true,
-      dynacast: true,
-    });
+    // Connect using the token generated by Supabase (start-agent-session)
+    await room.connect(livekitUrl, agentToken);
     console.log("✅ Agent connected to LiveKit room:", roomName);
 
-    // 2) Set up an AudioSource + LocalAudioTrack (correct rtc-node pattern)
-    const source = new AudioSource(16000, 1); // 16kHz mono
-    const track = LocalAudioTrack.createAudioTrack("agent-audio", source);
+    // Debug events
+    room.on(RoomEvent.ParticipantConnected, (p) => {
+      console.log("👤 Participant connected:", p.identity);
+    });
+
+    room.on(RoomEvent.TrackSubscribed, (track, pub, participant) => {
+      console.log(
+        "🎧 Track subscribed:",
+        track.kind,
+        "from",
+        participant.identity
+      );
+    });
+
+    // Create an AudioSource for 16k mono and publish as a "microphone" track
+    const audioSource = new AudioSource(SAMPLE_RATE, NUM_CHANNELS);
+    const track = LocalAudioTrack.createAudioTrack("agent-audio", audioSource);
 
     const publishOptions = new TrackPublishOptions();
     publishOptions.source = TrackSource.SOURCE_MICROPHONE;
@@ -138,29 +193,30 @@ async function startAgent({ livekitUrl, roomName, agentId, agentToken }) {
     await room.localParticipant.publishTrack(track, publishOptions);
     console.log("🔊 Agent audio track published");
 
-    // 3) Generate greeting via ElevenLabs
+    // Generate greeting from ElevenLabs
     const greeting =
-      "Hello, this is your twenty-one A I onboarding assistant. How can I help you set up your voice receptionist today?";
-    const samples = await ttsElevenLabsToInt16(greeting);
+      "Hello, this is your twenty one A I voice receptionist. How can I help you today?";
 
-    if (!samples) {
-      console.log("⚠ No PCM from ElevenLabs, skipping greeting.");
+    const pcm = await ttsElevenLabs(greeting);
+
+    if (!pcm) {
+      console.warn("⚠ No PCM from ElevenLabs, skipping greeting.");
       return;
     }
 
-    // 4) Push one audio frame into the AudioSource
-    const frame = new AudioFrame(samples, 16000, 1, samples.length);
-    await source.captureFrame(frame);
-    console.log("📤 Greeting audio frame sent to LiveKit");
+    console.log("🎧 ElevenLabs PCM samples:", pcm.length / 2);
 
-    // We keep the room open; Railway will keep the process alive.
+    // Stream the greeting PCM as frames into LiveKit
+    await playPcmAsFrames(audioSource, pcm);
+
+    console.log("✅ Greeting audio sent to LiveKit");
   } catch (err) {
     console.error("❌ startAgent failed:", err);
   }
 }
 
 // -------------------------------------------------------------
-// ROUTES
+// API Routes
 // -------------------------------------------------------------
 
 // Healthcheck
@@ -168,33 +224,33 @@ app.get("/", (req, res) => {
   res.send("21AI Agent Worker is running ✅");
 });
 
-// Called from Supabase start-agent-session edge function
+// Called by Supabase edge function: /start-session
 app.post("/start-session", async (req, res) => {
   try {
     const { livekitUrl, roomName, agentId, agentToken } = req.body || {};
 
     console.log("⚡ /start-session body:", JSON.stringify(req.body));
 
-    if (!roomName || !agentId || !agentToken) {
-      console.error("❌ /start-session missing fields");
+    if (!livekitUrl || !roomName || !agentId || !agentToken) {
+      console.error("❌ Missing required fields in /start-session");
       return res.status(400).json({
         ok: false,
         error: "missing_fields",
-        received: { roomName, agentId, hasToken: !!agentToken },
+        details: { livekitUrl, roomName, agentId, hasToken: !!agentToken },
       });
     }
 
-    // Fire-and-forget – do not await, just start the async agent
-    void startAgent({ livekitUrl, roomName, agentId, agentToken });
+    // Fire-and-forget: start the agent in the background
+    startAgent({ livekitUrl, roomName, agentId, agentToken });
 
-    return res.json({ ok: true });
+    return res.json({ ok: true, roomName, agentId });
   } catch (err) {
     console.error("❌ /start-session failed:", err);
     return res.status(500).json({ ok: false, error: "worker_crash" });
   }
 });
 
-// Start HTTP server
+// Start server
 app.listen(PORT, () => {
   console.log(`🚀 21AI Agent Worker listening on port ${PORT}`);
 });
