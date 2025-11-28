@@ -148,6 +148,79 @@ app.get("/", (req, res) => {
   res.send("21ai Agent Worker is running ✅");
 });
 
+// 🔍 LiveKit Connectivity Test
+app.get("/livekit-test", async (req, res) => {
+  const report = {
+    env: {
+      LIVEKIT_WS_URL: !!LIVEKIT_WS_URL,
+      LIVEKIT_API_KEY: !!LIVEKIT_API_KEY,
+      LIVEKIT_API_SECRET: !!LIVEKIT_API_SECRET,
+    },
+    token: {
+      ok: false,
+      error: null,
+    },
+    connect: {
+      ok: false,
+      error: null,
+    },
+  };
+
+  // 1) Check envs
+  if (!LIVEKIT_WS_URL || !LIVEKIT_API_KEY || !LIVEKIT_API_SECRET) {
+    report.token.error = "Missing one or more LiveKit env vars";
+    return res.status(500).json(report);
+  }
+
+  // 2) Try to generate a token
+  const testRoom = "livekit-test-room";
+  const testIdentity = `test_client_${Date.now()}`;
+
+  let jwt;
+  try {
+    const token = new AccessToken(LIVEKIT_API_KEY, LIVEKIT_API_SECRET, {
+      identity: testIdentity,
+    });
+
+    token.addGrant({
+      roomJoin: true,
+      room: testRoom,
+      canPublish: true,
+      canSubscribe: true,
+    });
+
+    jwt = token.toJwt();
+    report.token.ok = true;
+  } catch (err) {
+    console.error("❌ LiveKit test – token error:", err);
+    report.token.error = String(err);
+    return res.status(500).json(report);
+  }
+
+  // 3) Try to connect & disconnect
+  try {
+    const room = new Room();
+
+    room.on(RoomEvent.ParticipantConnected, (p) => {
+      console.log("🔍 [livekit-test] Participant connected:", p.identity);
+    });
+
+    console.log("🔍 [livekit-test] Connecting to", LIVEKIT_WS_URL);
+    await room.connect(LIVEKIT_WS_URL, jwt);
+    console.log("✅ [livekit-test] Connected as", testIdentity);
+
+    await room.disconnect();
+    console.log("✅ [livekit-test] Disconnected cleanly");
+
+    report.connect.ok = true;
+    return res.json(report);
+  } catch (err) {
+    console.error("❌ LiveKit test – connect error:", err);
+    report.connect.error = String(err);
+    return res.status(500).json(report);
+  }
+});
+
 // Supabase -> worker
 app.post("/start-session", async (req, res) => {
   try {
@@ -156,11 +229,11 @@ app.post("/start-session", async (req, res) => {
     console.log("⚡ start-session received:");
     console.log("room:", roomName);
     console.log("agent:", agentId);
-
-    if (!roomName || !agentId) {
-      return res.status(400).json({ ok: false, error: "invalid_request" });
-    }
-
+    ...
+  } catch (err) {
+    ...
+  }
+});
     // Fire and forget (join room + speak greeting)
     startAgent(roomName, agentId);
 
