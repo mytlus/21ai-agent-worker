@@ -3,7 +3,6 @@ import dotenv from "dotenv";
 import { AccessToken } from "livekit-server-sdk";
 import { Room, RoomEvent, AudioSource } from "@livekit/rtc-node";
 
-
 dotenv.config();
 
 const app = express();
@@ -23,8 +22,17 @@ console.log("LIVEKIT_API_KEY:", LIVEKIT_API_KEY ? "✓" : "❌ missing");
 console.log("LIVEKIT_API_SECRET:", LIVEKIT_API_SECRET ? "✓" : "❌ missing");
 console.log("ELEVENLABS_API_KEY:", ELEVENLABS_API_KEY ? "✓" : "❌ missing");
 
+// Audio config for ElevenLabs + LiveKit
+const SAMPLE_RATE = 16000;
+const CHANNELS = 1;
+
+// simple sleep helper for pacing frames
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
 // -------------------------------------------------------------
-// ElevenLabs TTS → PCM Buffer
+// ElevenLabs TTS → Int16Array PCM (16kHz mono)
 // -------------------------------------------------------------
 async function ttsElevenLabs(text) {
   try {
@@ -45,7 +53,7 @@ async function ttsElevenLabs(text) {
             stability: 0.4,
             similarity_boost: 0.8,
           },
-          output_format: "pcm_16000", // required for LiveKit
+          output_format: "pcm_16000", // 16kHz mono PCM
         }),
       }
     );
@@ -55,9 +63,11 @@ async function ttsElevenLabs(text) {
       return null;
     }
 
-    const buffer = Buffer.from(await res.arrayBuffer());
-    console.log("🎧 ElevenLabs PCM bytes:", buffer.length);
-    return buffer;
+    const arrayBuffer = await res.arrayBuffer();
+    const pcm16 = new Int16Array(arrayBuffer);
+
+    console.log("🎧 ElevenLabs PCM samples:", pcm16.length);
+    return pcm16;
   } catch (err) {
     console.error("❌ ElevenLabs request failed:", err);
     return null;
@@ -95,24 +105,34 @@ async function startAgent(roomName, agentId) {
       console.log("👤 Caller connected:", p.identity);
     });
 
-    // 3) Create an audio source (PCM 16k required)
-    const audioSource = new AudioSource(16000, 1);
+    // 3) Create an audio source (16kHz mono)
+    const audioSource = new AudioSource(SAMPLE_RATE, CHANNELS);
     const track = audioSource.createTrack();
     await room.localParticipant.publishTrack(track);
 
     console.log("🔊 Agent audio track published");
 
     // 4) Generate greeting via ElevenLabs
-    const greeting = "Hello! This is your 21AI voice assistant. How can I help you today?";
+    const greeting =
+      "Hello, this is your twenty one A I voice assistant. How can I help you today?";
     const pcm = await ttsElevenLabs(greeting);
 
-    if (pcm) {
-      console.log("📤 Sending greeting audio...");
-      audioSource.write(pcm);
-    } else {
+    if (!pcm) {
       console.log("⚠ No PCM from ElevenLabs");
+      return true;
     }
 
+    console.log("📤 Streaming greeting audio to room...");
+
+    // 20ms of audio at 16kHz mono = 320 samples per frame
+    const frameSamples = SAMPLE_RATE * CHANNELS * 0.02; // 320
+    for (let i = 0; i < pcm.length; i += frameSamples) {
+      const frame = pcm.subarray(i, i + frameSamples);
+      audioSource.write(frame);
+      await sleep(20); // pace to real time
+    }
+
+    console.log("✅ Finished sending greeting audio");
     return true;
   } catch (err) {
     console.error("❌ Agent connection failed:", err);
