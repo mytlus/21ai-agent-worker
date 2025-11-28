@@ -1,3 +1,4 @@
+// index.js – 21ai-agent-worker
 import express from "express";
 import dotenv from "dotenv";
 import { AccessToken } from "livekit-server-sdk";
@@ -10,7 +11,7 @@ app.use(express.json());
 
 const PORT = process.env.PORT || 3000;
 
-// ENV VARS FROM RAILWAY
+// --- ENV VARS FROM RAILWAY ---
 const LIVEKIT_WS_URL = process.env.LIVEKIT_WS_URL;
 const LIVEKIT_API_KEY = process.env.LIVEKIT_API_KEY;
 const LIVEKIT_API_SECRET = process.env.LIVEKIT_API_SECRET;
@@ -22,21 +23,17 @@ console.log("LIVEKIT_API_KEY:", LIVEKIT_API_KEY ? "✓" : "❌ missing");
 console.log("LIVEKIT_API_SECRET:", LIVEKIT_API_SECRET ? "✓" : "❌ missing");
 console.log("ELEVENLABS_API_KEY:", ELEVENLABS_API_KEY ? "✓" : "❌ missing");
 
-// Audio config for ElevenLabs + LiveKit
-const SAMPLE_RATE = 16000;
-const CHANNELS = 1;
-
-// simple sleep helper for pacing frames
-function sleep(ms) {
-  return new Promise((resolve) => setTimeout(resolve, ms));
-}
-
 // -------------------------------------------------------------
-// ElevenLabs TTS → Int16Array PCM (16kHz mono)
+// ElevenLabs TTS → PCM Buffer (16kHz mono)
 // -------------------------------------------------------------
 async function ttsElevenLabs(text) {
   try {
-    const voiceId = "EXAVITQu4vr4xnSDxMaL"; // Default ElevenLabs voice
+    if (!ELEVENLABS_API_KEY) {
+      console.error("❌ ELEVENLABS_API_KEY missing");
+      return null;
+    }
+
+    const voiceId = "EXAVITQu4vr4xnSDxMaL"; // default ElevenLabs voice
 
     const res = await fetch(
       `https://api.elevenlabs.io/v1/text-to-speech/${voiceId}`,
@@ -53,21 +50,20 @@ async function ttsElevenLabs(text) {
             stability: 0.4,
             similarity_boost: 0.8,
           },
-          output_format: "pcm_16000", // 16kHz mono PCM
+          output_format: "pcm_16000", // LiveKit wants 16k PCM
         }),
       }
     );
 
     if (!res.ok) {
-      console.error("❌ ElevenLabs TTS Error:", await res.text());
+      const txt = await res.text();
+      console.error("❌ ElevenLabs TTS Error:", txt);
       return null;
     }
 
-    const arrayBuffer = await res.arrayBuffer();
-    const pcm16 = new Int16Array(arrayBuffer);
-
-    console.log("🎧 ElevenLabs PCM samples:", pcm16.length);
-    return pcm16;
+    const buffer = Buffer.from(await res.arrayBuffer());
+    console.log("🎧 ElevenLabs PCM bytes:", buffer.length);
+    return buffer;
   } catch (err) {
     console.error("❌ ElevenLabs request failed:", err);
     return null;
@@ -79,9 +75,14 @@ async function ttsElevenLabs(text) {
 // -------------------------------------------------------------
 async function startAgent(roomName, agentId) {
   try {
+    if (!LIVEKIT_WS_URL || !LIVEKIT_API_KEY || !LIVEKIT_API_SECRET) {
+      console.error("❌ LiveKit env vars missing, cannot start agent");
+      return;
+    }
+
     const identity = `agent_${agentId}_${Date.now()}`;
 
-    // 1) Create LiveKit token
+    // 1) Create LiveKit token for the agent
     const token = new AccessToken(LIVEKIT_API_KEY, LIVEKIT_API_SECRET, {
       identity,
     });
@@ -94,19 +95,22 @@ async function startAgent(roomName, agentId) {
 
     const agentToken = token.toJwt();
 
-    // 2) Connect to room
+    // 2) Connect to room as agent
     const room = new Room();
-    await room.connect(LIVEKIT_WS_URL, agentToken);
 
-    console.log("🤖 Agent joined room:", roomName, "as", identity);
-
-    // Log participants
     room.on(RoomEvent.ParticipantConnected, (p) => {
       console.log("👤 Caller connected:", p.identity);
     });
+    room.on(RoomEvent.Error, (err) => {
+      console.error("❌ Room error:", err);
+    });
 
-    // 3) Create an audio source (16kHz mono)
-    const audioSource = new AudioSource(SAMPLE_RATE, CHANNELS);
+    console.log("🤖 Connecting agent to room:", roomName);
+    await room.connect(LIVEKIT_WS_URL, agentToken);
+    console.log("🤖 Agent joined room as:", identity);
+
+    // 3) Create an audio source (16k mono PCM)
+    const audioSource = new AudioSource(16000, 1);
     const track = audioSource.createTrack();
     await room.localParticipant.publishTrack(track);
 
@@ -114,26 +118,17 @@ async function startAgent(roomName, agentId) {
 
     // 4) Generate greeting via ElevenLabs
     const greeting =
-      "Hello, this is your twenty one A I voice assistant. How can I help you today?";
-    const pcm = await ttsElevenLabs(greeting);
+      "Hello, this is your twenty one A I receptionist. How can I help you today?";
 
+    const pcm = await ttsElevenLabs(greeting);
     if (!pcm) {
-      console.log("⚠ No PCM from ElevenLabs");
-      return true;
+      console.log("⚠ No PCM returned from ElevenLabs");
+      return;
     }
 
     console.log("📤 Streaming greeting audio to room...");
-
-    // 20ms of audio at 16kHz mono = 320 samples per frame
-    const frameSamples = SAMPLE_RATE * CHANNELS * 0.02; // 320
-    for (let i = 0; i < pcm.length; i += frameSamples) {
-      const frame = pcm.subarray(i, i + frameSamples);
-      audioSource.write(frame);
-      await sleep(20); // pace to real time
-    }
-
-    console.log("✅ Finished sending greeting audio");
-    return true;
+    audioSource.write(pcm);
+    console.log("✅ Greeting audio sent");
   } catch (err) {
     console.error("❌ Agent connection failed:", err);
   }
@@ -166,17 +161,15 @@ app.get("/livekit-test", async (req, res) => {
     },
   };
 
-  // 1) Check envs
   if (!LIVEKIT_WS_URL || !LIVEKIT_API_KEY || !LIVEKIT_API_SECRET) {
     report.token.error = "Missing one or more LiveKit env vars";
     return res.status(500).json(report);
   }
 
-  // 2) Try to generate a token
   const testRoom = "livekit-test-room";
   const testIdentity = `test_client_${Date.now()}`;
-
   let jwt;
+
   try {
     const token = new AccessToken(LIVEKIT_API_KEY, LIVEKIT_API_SECRET, {
       identity: testIdentity,
@@ -197,7 +190,6 @@ app.get("/livekit-test", async (req, res) => {
     return res.status(500).json(report);
   }
 
-  // 3) Try to connect & disconnect
   try {
     const room = new Room();
 
@@ -224,23 +216,33 @@ app.get("/livekit-test", async (req, res) => {
 // Supabase -> worker
 app.post("/start-session", async (req, res) => {
   try {
-    const { roomName, agentId } = req.body;
+    const { roomName, agentId } = req.body || {};
 
     console.log("⚡ start-session received:");
     console.log("room:", roomName);
     console.log("agent:", agentId);
-    ...
-  } catch (err) {
-    ...
-  }
-});
-    // Fire and forget (join room + speak greeting)
+
+    if (!roomName || !agentId) {
+      return res.status(400).json({
+        ok: false,
+        error: "roomName and agentId are required",
+      });
+    }
+
+    // Fire and forget – join room + speak greeting
     startAgent(roomName, agentId);
 
-    return res.json({ ok: true, roomName, agentId });
+    return res.json({
+      ok: true,
+      roomName,
+      agentId,
+    });
   } catch (err) {
     console.error("❌ /start-session failed:", err);
-    return res.status(500).json({ ok: false, error: "worker_crash" });
+    return res.status(500).json({
+      ok: false,
+      error: "worker_crash",
+    });
   }
 });
 
