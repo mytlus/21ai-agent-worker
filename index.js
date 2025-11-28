@@ -2,7 +2,7 @@ import express from "express";
 import dotenv from "dotenv";
 import { AccessToken } from "livekit-server-sdk";
 import { Room, RoomEvent, AudioSource } from "@livekit/rtc-node";
-import fetch from "node-fetch";
+
 
 dotenv.config();
 
