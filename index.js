@@ -1,4 +1,4 @@
-// index.js – 21AI Agent Worker (LiveKit + ElevenLabs TTS, streamed frames)
+// index.js – 21AI Agent Worker (LiveKit + ElevenLabs TTS, fixed streaming)
 
 import express from "express";
 import dotenv from "dotenv";
@@ -19,7 +19,7 @@ app.use(express.json());
 
 const PORT = process.env.PORT || 3000;
 
-// ENV – LiveKit URL here is just for logging; frontend sends its own
+// ENV – LiveKit URL here is just for logging; real URL comes per request
 const LIVEKIT_WS_URL = process.env.LIVEKIT_WS_URL || "(provided per request)";
 const ELEVENLABS_API_KEY = process.env.ELEVENLABS_API_KEY;
 
@@ -30,7 +30,7 @@ console.log(
   ELEVENLABS_API_KEY ? "✓ set" : "❌ MISSING (no voice)"
 );
 
-// basic safety logging
+// safety logging
 process.on("uncaughtException", (err) => {
   console.error("❌ Uncaught Exception:", err);
 });
@@ -51,7 +51,7 @@ async function ttsElevenLabs(text) {
       return null;
     }
 
-    const voiceId = "EXAVITQu4vr4xnSDxMaL"; // default ElevenLabs voice
+    const voiceId = "EXAVITQu4vr4xnSDxMaL"; // your chosen voice
 
     const res = await fetch(
       `https://api.elevenlabs.io/v1/text-to-speech/${voiceId}`,
@@ -80,8 +80,18 @@ async function ttsElevenLabs(text) {
     }
 
     const arrayBuf = await res.arrayBuffer();
-    const buffer = Buffer.from(arrayBuf);
-    console.log("🎧 ElevenLabs PCM bytes:", buffer.length);
+    let buffer = Buffer.from(arrayBuf);
+    console.log("🎧 ElevenLabs raw PCM bytes:", buffer.length);
+
+    // ⚠️ Make sure we have an even number of bytes (2 bytes per Int16)
+    if (buffer.length % 2 !== 0) {
+      console.warn(
+        "⚠ ElevenLabs returned odd byte length, trimming last byte for alignment"
+      );
+      buffer = buffer.subarray(0, buffer.length - 1);
+    }
+
+    console.log("🎧 ElevenLabs aligned PCM bytes:", buffer.length);
 
     return buffer;
   } catch (err) {
@@ -96,7 +106,7 @@ async function ttsElevenLabs(text) {
 const FRAME_DURATION_MS = 20; // 20ms frames
 const SAMPLES_PER_FRAME = Math.floor(
   (SAMPLE_RATE * FRAME_DURATION_MS) / 1000
-); // 16000 * 0.02 = 320 samples
+); // 16000 * 0.02 = 320
 
 async function playPcmAsFrames(audioSource, pcmBuffer) {
   if (!pcmBuffer || pcmBuffer.length === 0) {
@@ -104,8 +114,8 @@ async function playPcmAsFrames(audioSource, pcmBuffer) {
     return;
   }
 
-  // PCM16 => 2 bytes per sample
-  const totalSamples = Math.floor(pcmBuffer.length / 2);
+  // 2 bytes per sample
+  const totalSamples = pcmBuffer.length / 2;
   const pcmView = new Int16Array(
     pcmBuffer.buffer,
     pcmBuffer.byteOffset,
@@ -113,7 +123,7 @@ async function playPcmAsFrames(audioSource, pcmBuffer) {
   );
 
   console.log("🎧 PCM total samples:", totalSamples);
-  console.log("🎧 Using frame size (samples):", SAMPLES_PER_FRAME);
+  console.log("🎧 Frame size (samples):", SAMPLES_PER_FRAME);
 
   let offset = 0;
 
@@ -121,14 +131,13 @@ async function playPcmAsFrames(audioSource, pcmBuffer) {
     const remaining = totalSamples - offset;
     const frameSamples = Math.min(SAMPLES_PER_FRAME, remaining);
 
-    // Build a new Int16Array for this frame
+    // Build Int16Array for this frame
     const frameData = new Int16Array(frameSamples);
     for (let i = 0; i < frameSamples; i++) {
       frameData[i] = pcmView[offset + i];
     }
 
-    // IMPORTANT: correct AudioFrame ctor:
-    // new AudioFrame(buffer:Int16Array, sampleRate, numChannels, samplesPerChannel)
+    // Correct AudioFrame constructor: data, sampleRate, numChannels, samplesPerChannel
     const frame = new AudioFrame(
       frameData,
       SAMPLE_RATE,
@@ -138,13 +147,16 @@ async function playPcmAsFrames(audioSource, pcmBuffer) {
 
     await audioSource.captureFrame(frame);
     offset += frameSamples;
+
+    // ⏱️ Pace the frames to ~real-time playback
+    await new Promise((resolve) => setTimeout(resolve, FRAME_DURATION_MS));
   }
 
   console.log("📤 Finished streaming PCM frames to LiveKit");
 }
 
 // -------------------------------------------------------------
-// Agent: join room using token from Supabase + speak greeting
+// Agent: join room with token from Supabase + speak greeting
 // -------------------------------------------------------------
 async function startAgent({ livekitUrl, roomName, agentId, agentToken }) {
   try {
@@ -171,7 +183,7 @@ async function startAgent({ livekitUrl, roomName, agentId, agentToken }) {
       );
     });
 
-    // Create an AudioSource + track to publish TTS
+    // Create audio source + publish as a microphone-like track
     const audioSource = new AudioSource(SAMPLE_RATE, NUM_CHANNELS);
     const track = LocalAudioTrack.createAudioTrack("agent-audio", audioSource);
 
@@ -181,7 +193,7 @@ async function startAgent({ livekitUrl, roomName, agentId, agentToken }) {
     await room.localParticipant.publishTrack(track, publishOptions);
     console.log("🔊 Agent audio track published");
 
-    // Generate greeting from ElevenLabs
+    // TTS greeting
     const greeting =
       "Hello, this is your twenty one A I voice receptionist. How can I help you today?";
 
