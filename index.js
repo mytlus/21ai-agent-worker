@@ -5,6 +5,15 @@ import { connect } from "@livekit/rtc-node";
 
 dotenv.config();
 
+// Global error logging so we see any crashes
+process.on("uncaughtException", (err) => {
+  console.error("❌ Uncaught Exception:", err);
+});
+
+process.on("unhandledRejection", (reason) => {
+  console.error("❌ Unhandled Rejection:", reason);
+});
+
 const app = express();
 app.use(express.json());
 
@@ -15,7 +24,7 @@ const LIVEKIT_API_KEY = process.env.LIVEKIT_API_KEY;
 const LIVEKIT_API_SECRET = process.env.LIVEKIT_API_SECRET;
 
 if (!LIVEKIT_WS_URL || !LIVEKIT_API_KEY || !LIVEKIT_API_SECRET) {
-  console.warn("⚠️ Missing LiveKit env vars in worker (LIVEKIT_WS_URL / API_KEY / API_SECRET)");
+  console.warn("⚠️ Missing LiveKit env vars in worker (LIVEKIT_WS_URL / LIVEKIT_API_KEY / LIVEKIT_API_SECRET)");
 }
 
 // --- helper: start agent in background for a room ---
@@ -59,7 +68,7 @@ async function startAgentForSession(roomName, agentId) {
       console.log("👋 Agent disconnected from room:", roomName);
     });
 
-    // NOTE: we keep the room connection open; Railway will keep process alive
+    // We keep the room connection open; Railway keeps the process alive
   } catch (err) {
     console.error("❌ Error in startAgentForSession:", err);
   }
@@ -91,7 +100,7 @@ app.post("/start-session", async (req, res) => {
     // Fire-and-forget: start agent in the background
     startAgentForSession(roomName, agentId);
 
-    // Respond back to Supabase / frontend – we don't wait for agent join
+    // Respond back to Supabase / frontend – we don't wait for agent to fully join
     return res.json({
       ok: true,
       roomName,
