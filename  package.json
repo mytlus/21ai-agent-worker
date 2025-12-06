@@ -1,0 +1,19 @@
+{
+  "name": "21ai-agent-worker",
+  "version": "1.0.0",
+  "main": "dist/index.js",
+  "scripts": {
+    "dev": "ts-node src/index.ts",
+    "start": "node dist/index.js",
+    "build": "tsc"
+  },
+  "dependencies": {
+    "dotenv": "^16.0.0",
+    "express": "^4.19.0"
+  },
+  "devDependencies": {
+    "@types/express": "^4.17.21",
+    "ts-node": "^10.9.1",
+    "typescript": "^5.6.0"
+  }
+}
