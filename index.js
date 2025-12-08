@@ -1,4 +1,4 @@
-// index.js - LiveKit test agent worker (Railway)
+// index.js - LiveKit test agent worker (Railway) - STREAMED FRAMES VERSION
 
 const express = require('express');
 const cors = require('cors');
@@ -124,6 +124,7 @@ async function runTestAgentSession(agentToken) {
     const pcm = generateSinePcmInt16(FREQUENCY_HZ, DURATION_SEC, SAMPLE_RATE);
     console.log('[worker] Test tone generated', {
       samples: pcm.length,
+      approxSeconds: pcm.length / SAMPLE_RATE,
     });
 
     const source = new AudioSource(SAMPLE_RATE, 1);
@@ -136,21 +137,48 @@ async function runTestAgentSession(agentToken) {
     await room.localParticipant.publishTrack(track, options);
     console.log('[worker] ✅ Local audio track published');
 
-    // Create a single AudioFrame with the whole tone
-    const frame = new AudioFrame(pcm, SAMPLE_RATE, 1, pcm.length);
+    // ---- STREAM AUDIO IN 20ms FRAMES ----
+    const FRAME_DURATION_MS = 20;
+    const FRAME_SAMPLES = (SAMPLE_RATE * FRAME_DURATION_MS) / 1000; // 960 samples at 48k
+    console.log('[worker] Streaming frames...', {
+      frameSamples: FRAME_SAMPLES,
+      frameDurationMs: FRAME_DURATION_MS,
+    });
 
-    console.log('[worker] Capturing AudioFrame (sending test tone to room)...');
-    await source.captureFrame(frame);
-    console.log('[worker] ✅ AudioFrame captured (tone should be playing in the room)');
+    let offset = 0;
+    let frameIndex = 0;
 
-    // Keep the participant alive long enough for tone to play
-    await sleep(DURATION_SEC * 1000 + 1500);
+    while (offset < pcm.length) {
+      const end = Math.min(offset + FRAME_SAMPLES, pcm.length);
+      const slice = pcm.subarray(offset, end);
+
+      // create AudioFrame from slice
+      const frame = new AudioFrame(slice, SAMPLE_RATE, 1, slice.length);
+
+      await source.captureFrame(frame);
+      frameIndex += 1;
+
+      if (frameIndex % 10 === 0) {
+        console.log(
+          `[worker] Sent frame #${frameIndex} (samples: ${slice.length}, offset: ${offset}/${pcm.length})`
+        );
+      }
+
+      offset = end;
+
+      // Pace frames at realtime
+      await sleep(FRAME_DURATION_MS);
+    }
+
+    console.log('[worker] 🎧 Finished streaming test tone, total frames:', frameIndex);
+
+    // keep participant alive a bit longer
+    await sleep(1000);
 
     console.log('[worker] Closing track & disconnecting...');
     await track.close();
     await room.disconnect();
     await dispose();
-
     console.log('[worker] ✅ Test agent session complete');
   } catch (err) {
     console.error('[worker] ❌ Error in runTestAgentSession:', err);
