@@ -1,198 +1,244 @@
-// index.js - LiveKit test agent worker (Railway) - STREAMED FRAMES VERSION
+// supabase/functions/livekit-agent-worker/index.ts
 
-const express = require('express');
-const cors = require('cors');
+// Edge function that calls the Railway LiveKit worker
+// - GET /health on the worker (with timeout + diagnostics)
+// - POST /start-session with the original payload (with timeout + diagnostics)
 
-const {
-  Room,
-  RoomEvent,
-  dispose,
-  AudioFrame,
-  AudioSource,
-  LocalAudioTrack,
-  TrackPublishOptions,
-  TrackSource,
-} = require('@livekit/rtc-node');
+const corsHeaders: Record<string, string> = {
+  'Access-Control-Allow-Origin': '*',
+  'Access-Control-Allow-Methods': 'POST, OPTIONS',
+  'Access-Control-Allow-Headers': 'authorization, x-client-info, apikey, content-type',
+};
 
-const app = express();
-app.use(cors());
-app.use(express.json());
+const WORKER_BASE_URL =
+  Deno.env.get('LIVEKIT_AGENT_WORKER_URL') ??
+  'https://glistening-truth-production-61ed.up.railway.app';
 
-const PORT = process.env.PORT || 3000;
-const LIVEKIT_WS_URL = process.env.LIVEKIT_WS_URL;
+const HEALTH_TIMEOUT_MS = 8000;
+const START_SESSION_TIMEOUT_MS = 20000;
 
-// ---------- Helpers ----------
-
-function sleep(ms) {
-  return new Promise((resolve) => setTimeout(resolve, ms));
+interface EdgeResponseBody {
+  ok: boolean;
+  phaseTimings?: {
+    healthCheck?: number;
+    startSession?: number;
+    total: number;
+  };
+  health?: unknown;
+  worker?: unknown;
+  errorClass?: string;
+  errorMessage?: string;
 }
 
-// Generate an Int16 PCM sine wave buffer
-function generateSinePcmInt16(frequency, durationSec, sampleRate) {
-  const totalSamples = Math.floor(durationSec * sampleRate);
-  const data = new Int16Array(totalSamples);
-
-  const amplitude = 0.25 * 0x7fff; // 25% of full scale to avoid clipping
-
-  for (let i = 0; i < totalSamples; i++) {
-    const t = i / sampleRate;
-    const sample = Math.sin(2 * Math.PI * frequency * t);
-    data[i] = Math.round(sample * amplitude);
+Deno.serve(async (req: Request): Promise<Response> => {
+  if (req.method === 'OPTIONS') {
+    return new Response(null, { headers: corsHeaders });
   }
 
-  return data;
-}
-
-// ---------- Health check ----------
-
-app.get('/health', (req, res) => {
-  res.json({
-    ok: true,
-    service: 'livekit-test-worker',
-    uptimeSeconds: Math.round(process.uptime()),
-    livekitUrlConfigured: !!LIVEKIT_WS_URL,
+  const t0 = Date.now();
+  console.log('[livekit-agent-worker] Incoming request:', {
+    url: req.url,
+    method: req.method,
   });
-});
-
-// ---------- Start session ----------
-
-app.post('/start-session', async (req, res) => {
-  const startTime = Date.now();
-  console.log('[worker] POST /start-session payload:', JSON.stringify(req.body, null, 2));
-
-  if (!LIVEKIT_WS_URL) {
-    console.error('[worker] LIVEKIT_WS_URL is not set');
-    return res.status(500).json({ ok: false, error: 'LIVEKIT_WS_URL not configured' });
-  }
-
-  const { agentToken } = req.body || {};
-
-  if (!agentToken) {
-    console.error('[worker] Missing agentToken in request body');
-    return res.status(400).json({ ok: false, error: 'Missing agentToken' });
-  }
-
-  // Fire-and-forget so Supabase isn’t blocked
-  runTestAgentSession(agentToken).catch((err) => {
-    console.error('[worker] Unhandled error in runTestAgentSession:', err);
-  });
-
-  const elapsed = Date.now() - startTime;
-  console.log(`[worker] /start-session returning ok in ${elapsed}ms`);
-  return res.json({ ok: true });
-});
-
-// ---------- Core: join room & play test tone ----------
-
-async function runTestAgentSession(agentToken) {
-  const connectStarted = Date.now();
-  console.log('[worker] ▶ Starting test agent session');
-
-  const room = new Room();
 
   try {
-    console.log('[worker] Connecting to LiveKit...', {
-      livekitUrl: LIVEKIT_WS_URL,
-    });
+    const body = await req.json().catch(() => ({}));
+    console.log('[livekit-agent-worker] Payload from frontend:', body);
 
-    await room.connect(LIVEKIT_WS_URL, agentToken, {
-      autoSubscribe: true,
-      dynacast: true,
-    });
+    const phaseTimings: EdgeResponseBody['phaseTimings'] = {
+      total: 0,
+    };
 
-    console.log(
-      '[worker] ✅ Connected to room as',
-      room.localParticipant?.identity || '(no identity)',
-      `in ${Date.now() - connectStarted}ms`
-    );
+    // ---------- Phase 1: Worker health check ----------
 
-    room.on(RoomEvent.Disconnected, () => {
-      console.log('[worker] RoomEvent.Disconnected');
-    });
+    const healthStart = Date.now();
+    let healthResult: unknown = null;
+    let healthErrorClass: string | undefined;
 
-    // ---- Publish test audio track ----
-    const SAMPLE_RATE = 48000;       // 48kHz
-    const DURATION_SEC = 6;          // 6 second tone
-    const FREQUENCY_HZ = 440;        // A4
+    try {
+      const healthController = new AbortController();
+      const healthTimeout = setTimeout(
+        () => healthController.abort(),
+        HEALTH_TIMEOUT_MS,
+      );
 
-    console.log('[worker] Generating test tone PCM buffer...', {
-      sampleRate: SAMPLE_RATE,
-      durationSec: DURATION_SEC,
-      frequencyHz: FREQUENCY_HZ,
-    });
+      const healthUrl = `${WORKER_BASE_URL.replace(/\/$/, '')}/health`;
+      console.log('[livekit-agent-worker] ▶ Calling worker /health:', {
+        healthUrl,
+        timeoutMs: HEALTH_TIMEOUT_MS,
+      });
 
-    const pcm = generateSinePcmInt16(FREQUENCY_HZ, DURATION_SEC, SAMPLE_RATE);
-    console.log('[worker] Test tone generated', {
-      samples: pcm.length,
-      approxSeconds: pcm.length / SAMPLE_RATE,
-    });
+      const healthRes = await fetch(healthUrl, {
+        method: 'GET',
+        signal: healthController.signal,
+      }).catch((err) => {
+        throw err;
+      });
 
-    const source = new AudioSource(SAMPLE_RATE, 1);
-    const track = LocalAudioTrack.createAudioTrack('agent-test-audio', source);
+      clearTimeout(healthTimeout);
 
-    const options = new TrackPublishOptions();
-    options.source = TrackSource.SOURCE_MICROPHONE;
+      const healthText = await healthRes.text();
+      const healthHeaders: Record<string, string> = {};
+      healthRes.headers.forEach((v, k) => {
+        if (['x-railway-request-id', 'x-request-id', 'content-type'].includes(k.toLowerCase())) {
+          healthHeaders[k] = v;
+        }
+      });
 
-    console.log('[worker] Publishing local audio track...');
-    await room.localParticipant.publishTrack(track, options);
-    console.log('[worker] ✅ Local audio track published');
+      console.log('[livekit-agent-worker] ◀ /health response:', {
+        status: healthRes.status,
+        headers: healthHeaders,
+        bodySnippet: healthText.slice(0, 300),
+      });
 
-    // ---- STREAM AUDIO IN 20ms FRAMES ----
-    const FRAME_DURATION_MS = 20;
-    const FRAME_SAMPLES = (SAMPLE_RATE * FRAME_DURATION_MS) / 1000; // 960 samples at 48k
-    console.log('[worker] Streaming frames...', {
-      frameSamples: FRAME_SAMPLES,
-      frameDurationMs: FRAME_DURATION_MS,
-    });
-
-    let offset = 0;
-    let frameIndex = 0;
-
-    while (offset < pcm.length) {
-      const end = Math.min(offset + FRAME_SAMPLES, pcm.length);
-      const slice = pcm.subarray(offset, end);
-
-      // create AudioFrame from slice
-      const frame = new AudioFrame(slice, SAMPLE_RATE, 1, slice.length);
-
-      await source.captureFrame(frame);
-      frameIndex += 1;
-
-      if (frameIndex % 10 === 0) {
-        console.log(
-          `[worker] Sent frame #${frameIndex} (samples: ${slice.length}, offset: ${offset}/${pcm.length})`
-        );
+      try {
+        healthResult = JSON.parse(healthText);
+      } catch {
+        healthResult = { raw: healthText };
       }
 
-      offset = end;
-
-      // Pace frames at realtime
-      await sleep(FRAME_DURATION_MS);
+      if (!healthRes.ok) {
+        healthErrorClass = `WORKER_HEALTH_HTTP_${healthRes.status}`;
+      }
+    } catch (err) {
+      if (err instanceof DOMException && err.name === 'AbortError') {
+        console.error(
+          '[livekit-agent-worker] ❌ /health timed out (AbortError)',
+          { timeoutMs: HEALTH_TIMEOUT_MS },
+        );
+        healthErrorClass = 'WORKER_HEALTH_TIMEOUT';
+      } else {
+        console.error('[livekit-agent-worker] ❌ /health network/error:', err);
+        healthErrorClass = 'WORKER_HEALTH_NETWORK_ERROR';
+      }
     }
 
-    console.log('[worker] 🎧 Finished streaming test tone, total frames:', frameIndex);
+    phaseTimings.healthCheck = Date.now() - healthStart;
 
-    // keep participant alive a bit longer
-    await sleep(1000);
+    // ---------- Phase 2: /start-session on worker ----------
 
-    console.log('[worker] Closing track & disconnecting...');
-    await track.close();
-    await room.disconnect();
-    await dispose();
-    console.log('[worker] ✅ Test agent session complete');
-  } catch (err) {
-    console.error('[worker] ❌ Error in runTestAgentSession:', err);
+    const startSessionStart = Date.now();
+    let workerResponse: unknown = null;
+    let startErrorClass: string | undefined;
+    let startHttpStatus = 0;
+
     try {
-      await room.disconnect();
-      await dispose();
-    } catch (cleanupErr) {
-      console.error('[worker] Error during cleanup:', cleanupErr);
+      const startController = new AbortController();
+      const startTimeout = setTimeout(
+        () => startController.abort(),
+        START_SESSION_TIMEOUT_MS,
+      );
+
+      const startUrl = `${WORKER_BASE_URL.replace(/\/$/, '')}/start-session`;
+      console.log('[livekit-agent-worker] ▶ Calling worker /start-session:', {
+        startUrl,
+        timeoutMs: START_SESSION_TIMEOUT_MS,
+      });
+
+      const startRes = await fetch(startUrl, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify(body ?? {}),
+        signal: startController.signal,
+      });
+
+      clearTimeout(startTimeout);
+      startHttpStatus = startRes.status;
+
+      const headers: Record<string, string> = {};
+      startRes.headers.forEach((v, k) => {
+        if (['x-railway-request-id', 'x-request-id', 'content-type'].includes(k.toLowerCase())) {
+          headers[k] = v;
+        }
+      });
+
+      const text = await startRes.text();
+
+      console.log('[livekit-agent-worker] ◀ /start-session response:', {
+        status: startRes.status,
+        headers,
+        bodySnippet: text.slice(0, 300),
+      });
+
+      try {
+        workerResponse = JSON.parse(text);
+      } catch {
+        workerResponse = { raw: text };
+      }
+
+      if (!startRes.ok) {
+        startErrorClass = `WORKER_START_HTTP_${startRes.status}`;
+      }
+    } catch (err) {
+      if (err instanceof DOMException && err.name === 'AbortError') {
+        console.error(
+          '[livekit-agent-worker] ❌ /start-session timed out (AbortError)',
+          { timeoutMs: START_SESSION_TIMEOUT_MS },
+        );
+        startErrorClass = 'WORKER_START_TIMEOUT';
+      } else {
+        console.error('[livekit-agent-worker] ❌ /start-session network/error:', err);
+        startErrorClass = 'WORKER_START_NETWORK_ERROR';
+      }
     }
+
+    phaseTimings.startSession = Date.now() - startSessionStart;
+    phaseTimings.total = Date.now() - t0;
+
+    // ---------- Error classification & response ----------
+
+    const errorClass = startErrorClass || healthErrorClass;
+
+    console.log('[livekit-agent-worker] Phase timings:', phaseTimings);
+    console.log('[livekit-agent-worker] Error classification:', errorClass ?? 'NONE');
+
+    const responseBody: EdgeResponseBody = {
+      ok: !errorClass,
+      phaseTimings,
+      health: healthResult,
+      worker: workerResponse,
+      errorClass: errorClass,
+      errorMessage:
+        errorClass === 'WORKER_START_TIMEOUT'
+          ? 'Worker /start-session timed out'
+          : errorClass === 'WORKER_HEALTH_TIMEOUT'
+          ? 'Worker /health timed out'
+          : errorClass ?? undefined,
+    };
+
+    // Decide HTTP status for the edge response
+    const status =
+      errorClass && startHttpStatus >= 500
+        ? 502
+        : errorClass && startHttpStatus >= 400
+        ? startHttpStatus
+        : 200;
+
+    return new Response(JSON.stringify(responseBody), {
+      status,
+      headers: {
+        ...corsHeaders,
+        'Content-Type': 'application/json',
+      },
+    });
+  } catch (err) {
+    console.error('[livekit-agent-worker] ❌ Unhandled error:', err);
+
+    const body: EdgeResponseBody = {
+      ok: false,
+      phaseTimings: { total: Date.now() - t0 },
+      errorClass: 'EDGE_UNHANDLED_ERROR',
+      errorMessage: err instanceof Error ? err.message : String(err),
+    };
+
+    return new Response(JSON.stringify(body), {
+      status: 500,
+      headers: {
+        ...corsHeaders,
+        'Content-Type': 'application/json',
+      },
+    });
   }
-}
-
-// ---------- Start server ----------
-
-app.listen(PORT, () => {
-  console.log(`[worker] LiveKit test worker listening on port ${PORT}`);
 });
