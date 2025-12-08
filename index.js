@@ -1,7 +1,7 @@
-// index.js – MINIMAL STABLE 21ai agent worker (Node / Express)
+// index.js – MINIMAL STABLE 21ai agent worker (ESM / Express)
 
-const express = require('express');
-const cors = require('cors');
+import express from 'express';
+import cors from 'cors';
 
 const app = express();
 app.use(cors());
@@ -14,7 +14,7 @@ const SERVICE_NAME = '21ai-agent-worker';
 // --- Health check ----------------------------------------------------------
 
 app.get('/health', (req, res) => {
-  console.log(`[worker] GET /health`);
+  console.log('[worker] GET /health');
   res.json({
     ok: true,
     service: SERVICE_NAME,
