@@ -1,4 +1,4 @@
-// index.js – 21AI Agent Worker (LiveKit + ElevenLabs TTS, fully fixed)
+// index.js – 21AI Agent Worker (LiveKit + ElevenLabs TTS, updated)
 
 import express from "express";
 import dotenv from "dotenv";
@@ -20,11 +20,11 @@ app.use(express.json());
 const PORT = process.env.PORT || 3000;
 
 // ENV
-const LIVEKIT_WS_URL = process.env.LIVEKIT_WS_URL || "(provided per request)";
+const LIVEKIT_WS_URL = process.env.LIVEKIT_WS_URL || ""; // fallback URL
 const ELEVENLABS_API_KEY = process.env.ELEVENLABS_API_KEY;
 
-console.log("21AI Agent Worker booted");
-console.log("LIVEKIT_WS_URL:", LIVEKIT_WS_URL);
+console.log("🚀 21AI Agent Worker booted");
+console.log("LIVEKIT_WS_URL:", LIVEKIT_WS_URL || "(not set, expecting per-request livekitUrl)");
 console.log("ELEVENLABS_API_KEY:", ELEVENLABS_API_KEY ? "✓ set" : "❌ MISSING");
 
 // Safety logs
@@ -33,6 +33,21 @@ process.on("uncaughtException", (err) => {
 });
 process.on("unhandledRejection", (reason) => {
   console.error("❌ Unhandled Rejection:", reason);
+});
+
+// ----------------------------------------------------
+// Health endpoint
+// ----------------------------------------------------
+app.get("/health", (_req, res) => {
+  res.json({
+    ok: true,
+    status: "healthy",
+    env: {
+      hasLivekitWsUrl: !!LIVEKIT_WS_URL,
+      hasElevenLabsKey: !!ELEVENLABS_API_KEY,
+    },
+    timestamp: new Date().toISOString(),
+  });
 });
 
 // ----------------------------------------------------
@@ -148,10 +163,16 @@ async function playPcmAsFrames(audioSource, pcmBuffer) {
 
 async function startAgent({ livekitUrl, roomName, agentId, agentToken }) {
   try {
-    const identity = `agent_${agentId}_${Date.now()}`;
+    const identity = `agent_${agentId || "unknown"}_${Date.now()}`;
 
     console.log("🤖 Agent starting:", identity);
     console.log("🔗 LiveKit URL:", livekitUrl);
+    console.log("🏷  Room name:", roomName);
+
+    if (!agentToken) {
+      console.warn("⚠ No agentToken provided – cannot connect to LiveKit.");
+      return;
+    }
 
     const room = new Room();
     await room.connect(livekitUrl, agentToken);
@@ -180,11 +201,13 @@ async function startAgent({ livekitUrl, roomName, agentId, agentToken }) {
       "Hello, this is your Twenty One A I voice agent. How may I assist you today?";
 
     const pcm = await ttsElevenLabs(greeting);
-    if (!pcm) return console.warn("⚠ No PCM produced");
+    if (!pcm) {
+      console.warn("⚠ No PCM produced");
+      return;
+    }
 
     await playPcmAsFrames(audioSource, pcm);
     console.log("✅ Greeting sent");
-
   } catch (err) {
     console.error("❌ Agent error:", err);
   }
@@ -194,7 +217,7 @@ async function startAgent({ livekitUrl, roomName, agentId, agentToken }) {
 // Routes
 // ----------------------------------------------------
 
-app.get("/", (req, res) => {
+app.get("/", (_req, res) => {
   res.send("21AI Agent Worker is running ✅");
 });
 
@@ -202,20 +225,50 @@ app.post("/start-session", async (req, res) => {
   try {
     const { livekitUrl, roomName, agentId, agentToken } = req.body;
 
-    console.log("⚡ start-session payload:", req.body);
+    console.log("⚡ /start-session payload:", req.body);
 
-    if (!livekitUrl || !roomName || !agentId || !agentToken) {
-      return res
-        .status(400)
-        .json({ ok: false, error: "missing_fields", received: req.body });
+    // Normalise LiveKit URL: prefer request; fall back to env
+    const resolvedLivekitUrl = livekitUrl || LIVEKIT_WS_URL || null;
+
+    const missing = [];
+    if (!resolvedLivekitUrl) missing.push("livekitUrl or LIVEKIT_WS_URL");
+    if (!roomName) missing.push("roomName");
+    if (!agentId) missing.push("agentId");
+    // agentToken is optional for now (we will still warn)
+
+    if (missing.length > 0) {
+      console.warn("⚠ Missing required fields for /start-session:", missing);
+      return res.status(400).json({
+        ok: false,
+        error: "missing_fields",
+        missing,
+        received: req.body,
+      });
+    }
+
+    if (!agentToken) {
+      console.warn(
+        "⚠ /start-session: agentToken missing – returning ok but NOT starting agent audio."
+      );
+      return res.json({
+        ok: true,
+        roomName,
+        agentId,
+        warning: "agentToken missing – no audio started by worker",
+      });
     }
 
     // Fire-and-forget
-    startAgent({ livekitUrl, roomName, agentId, agentToken });
+    startAgent({
+      livekitUrl: resolvedLivekitUrl,
+      roomName,
+      agentId,
+      agentToken,
+    });
 
     res.json({ ok: true, roomName, agentId });
   } catch (err) {
-    console.error("❌ start-session route error:", err);
+    console.error("❌ /start-session route error:", err);
     res.status(500).json({ ok: false, error: "server_error" });
   }
 });
@@ -230,6 +283,11 @@ app.post("/tts", async (req, res) => {
 
     if (!text) {
       return res.status(400).json({ ok: false, error: "missing_text" });
+    }
+
+    if (!ELEVENLABS_API_KEY) {
+      console.error("❌ ELEVENLABS_API_KEY missing for /tts");
+      return res.status(500).json({ ok: false, error: "tts_not_configured" });
     }
 
     const finalVoiceId = voiceId || "EXAVITQu4vr4xnSDxMaL";
