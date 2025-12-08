@@ -1,4 +1,4 @@
-// index.js – 21AI Agent Worker (LiveKit + Internal Test Tone / ElevenLabs)
+// index.js – 21AI Agent Worker (LiveKit + 48kHz Internal Test Tone / optional ElevenLabs)
 
 import express from "express";
 import dotenv from "dotenv";
@@ -29,7 +29,25 @@ console.log("LIVEKIT_WS_URL:", LIVEKIT_WS_URL);
 console.log("ELEVENLABS_API_KEY:", ELEVENLABS_API_KEY ? "✓ set" : "❌ MISSING");
 console.log("TTS_MODE:", TTS_MODE);
 
-// Safety logs
+// ----------------------------------------------------
+// Audio constants – 48 kHz mono (LiveKit default)
+// ----------------------------------------------------
+
+const SAMPLE_RATE = 48000;
+const NUM_CHANNELS = 1;
+const FRAME_DURATION_MS = 20; // 20ms frames
+const SAMPLES_PER_FRAME = Math.floor((SAMPLE_RATE * FRAME_DURATION_MS) / 1000); // 960
+const BYTES_PER_SAMPLE = 2;
+const FRAME_SIZE_BYTES = SAMPLES_PER_FRAME * BYTES_PER_SAMPLE;
+
+// ----------------------------------------------------
+// Helpers
+// ----------------------------------------------------
+
+function sleep(ms) {
+  return new Promise((res) => setTimeout(res, ms));
+}
+
 process.on("uncaughtException", (err) => {
   console.error("❌ Uncaught Exception:", err);
 });
@@ -38,37 +56,14 @@ process.on("unhandledRejection", (reason) => {
 });
 
 // ----------------------------------------------------
-// Audio constants (16 kHz mono PCM)
+// INTERNAL TEST TONE (440 Hz sine, 48kHz PCM 16-bit)
 // ----------------------------------------------------
 
-const SAMPLE_RATE = 16000;
-const NUM_CHANNELS = 1;
-const FRAME_DURATION_MS = 20; // 20 ms
-const SAMPLES_PER_FRAME = Math.floor((SAMPLE_RATE * FRAME_DURATION_MS) / 1000); // 320 samples
-const BYTES_PER_SAMPLE = 2;
-const FRAME_SIZE_BYTES = SAMPLES_PER_FRAME * BYTES_PER_SAMPLE;
-
-// ----------------------------------------------------
-// Helper: sleep
-// ----------------------------------------------------
-
-function sleep(ms) {
-  return new Promise((res) => setTimeout(res, ms));
-}
-
-// ----------------------------------------------------
-// INTERNAL TEST TONE (440 Hz sine, PCM 16-bit LE)
-// ----------------------------------------------------
-
-/**
- * Generate a PCM 16-bit mono test tone (sine) at 440 Hz.
- * Returns a Buffer containing raw PCM data at SAMPLE_RATE.
- */
 function generateTestTonePcm(durationSeconds = 2, frequency = 440) {
   const totalSamples = Math.floor(durationSeconds * SAMPLE_RATE);
   const pcm = new Int16Array(totalSamples);
 
-  const amplitude = 0.25 * 32767; // avoid clipping
+  const amplitude = 0.25 * 32767;
   const twoPiFDivSR = (2 * Math.PI * frequency) / SAMPLE_RATE;
 
   for (let i = 0; i < totalSamples; i++) {
@@ -79,16 +74,16 @@ function generateTestTonePcm(durationSeconds = 2, frequency = 440) {
   console.log("🎼 Generated test tone:", {
     durationSeconds,
     frequency,
+    sampleRate: SAMPLE_RATE,
     totalSamples,
     bytes: totalSamples * BYTES_PER_SAMPLE,
   });
 
-  // Create a Buffer that exactly wraps the Int16Array
   return Buffer.from(pcm.buffer, pcm.byteOffset, pcm.byteLength);
 }
 
 // ----------------------------------------------------
-// ElevenLabs TTS → PCM 16kHz mono (optional)
+// ElevenLabs TTS → PCM 48kHz mono (optional)
 // ----------------------------------------------------
 
 async function ttsElevenLabs(text) {
@@ -98,7 +93,7 @@ async function ttsElevenLabs(text) {
       return null;
     }
 
-    const voiceId = "EXAVITQu4vr4xnSDxMaL"; // Default voice
+    const voiceId = "EXAVITQu4vr4xnSDxMaL";
 
     console.log("🗣 ElevenLabs TTS requested, text length:", text.length);
 
@@ -113,8 +108,8 @@ async function ttsElevenLabs(text) {
         body: JSON.stringify({
           text,
           model_id: "eleven_multilingual_v2",
-          // IMPORTANT: request PCM at 16 kHz mono
-          output_format: "pcm_16000",
+          // ask for PCM at 48 kHz mono so it matches our AudioSource
+          output_format: "pcm_48000",
           voice_settings: {
             stability: 0.4,
             similarity_boost: 0.8,
@@ -128,10 +123,8 @@ async function ttsElevenLabs(text) {
       return null;
     }
 
-    const arrayBuf = await response.arrayBuffer();
-    let buffer = Buffer.from(arrayBuf);
+    let buffer = Buffer.from(await response.arrayBuffer());
 
-    // Ensure even length (2 bytes per sample)
     if (buffer.length % 2 !== 0) {
       console.warn("⚠ ElevenLabs PCM odd-length buffer, trimming 1 byte");
       buffer = buffer.subarray(0, buffer.length - 1);
@@ -165,8 +158,8 @@ async function playPcmAsFrames(audioSource, pcmBuffer) {
   console.log("🎧 Streaming PCM to LiveKit:", {
     totalBytes: pcmBuffer.length,
     totalSamples: pcmBuffer.length / BYTES_PER_SAMPLE,
-    frameSizeBytes: FRAME_SIZE_BYTES,
     samplesPerFrame: SAMPLES_PER_FRAME,
+    frameSizeBytes: FRAME_SIZE_BYTES,
     frames: Math.ceil(pcmBuffer.length / FRAME_SIZE_BYTES),
   });
 
@@ -175,8 +168,7 @@ async function playPcmAsFrames(audioSource, pcmBuffer) {
   while (offset < pcmBuffer.length) {
     const endOffset = Math.min(offset + FRAME_SIZE_BYTES, pcmBuffer.length);
 
-    // Use subarray, NOT slice
-    const frameBytes = pcmBuffer.subarray(offset, endOffset);
+    const frameBytes = pcmBuffer.subarray(offset, endOffset); // subarray ✅
 
     const int16Data = new Int16Array(
       frameBytes.buffer,
@@ -188,11 +180,12 @@ async function playPcmAsFrames(audioSource, pcmBuffer) {
       int16Data,
       SAMPLE_RATE,
       NUM_CHANNELS,
-      int16Data.length // samples_per_channel
+      int16Data.length
     );
 
     await audioSource.captureFrame(frame);
     await sleep(FRAME_DURATION_MS);
+
     offset = endOffset;
   }
 
@@ -221,7 +214,7 @@ async function startAgent({ livekitUrl, roomName, agentId, agentToken }) {
     });
 
     room.on(RoomEvent.TrackSubscribed, (track, pub, participant) => {
-      console.log("🎧 TrackSubscribed:", {
+      console.log("🎧 [Worker] TrackSubscribed:", {
         identity: participant.identity,
         kind: track.kind,
         source: pub.source,
@@ -229,7 +222,7 @@ async function startAgent({ livekitUrl, roomName, agentId, agentToken }) {
       });
     });
 
-    // Init audio publishing at 16 kHz mono
+    // 48kHz mono audio source
     const audioSource = new AudioSource(SAMPLE_RATE, NUM_CHANNELS);
     const track = LocalAudioTrack.createAudioTrack("agent-audio", audioSource);
 
@@ -239,13 +232,11 @@ async function startAgent({ livekitUrl, roomName, agentId, agentToken }) {
     await room.localParticipant.publishTrack(track, publishOptions);
     console.log("🔊 Agent track published");
 
-    // ------------------------------------------------
-    // Choose audio source based on TTS_MODE
-    // ------------------------------------------------
+    // Choose PCM source
     let pcm;
 
     if (TTS_MODE === "test") {
-      console.log("🔬 Using INTERNAL TEST TONE for greeting (440 Hz)");
+      console.log("🔬 Using INTERNAL TEST TONE for greeting (440 Hz, 48kHz)");
       pcm = generateTestTonePcm(2, 440);
     } else {
       const greeting =
@@ -304,7 +295,7 @@ app.post("/start-session", async (req, res) => {
       });
     }
 
-    // Fire-and-forget
+    // fire-and-forget
     startAgent({ livekitUrl, roomName, agentId, agentToken });
 
     res.json({ ok: true, roomName, agentId });
@@ -314,10 +305,7 @@ app.post("/start-session", async (req, res) => {
   }
 });
 
-// ----------------------------------------------------
-// ElevenLabs Browser TTS Endpoint (MP3 passthrough)
-// ----------------------------------------------------
-
+// Browser-side ElevenLabs MP3 helper (unchanged)
 app.post("/tts", async (req, res) => {
   try {
     const { text, voiceId } = req.body;
@@ -367,7 +355,7 @@ app.post("/tts", async (req, res) => {
 });
 
 // ----------------------------------------------------
-// Start Server
+// Start server
 // ----------------------------------------------------
 
 app.listen(PORT, () => {
