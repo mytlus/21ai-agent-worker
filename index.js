@@ -1,4 +1,4 @@
-// index.js – 21AI Agent Worker (LiveKit + ElevenLabs TTS, with test-tone switch)
+// index.js – 21AI Agent Worker (LiveKit + Internal Test Tone / ElevenLabs)
 
 import express from "express";
 import dotenv from "dotenv";
@@ -17,20 +17,17 @@ dotenv.config();
 const app = express();
 app.use(express.json());
 
-const PORT = process.env.PORT || 8080;
+const PORT = process.env.PORT || 3000;
 
-// -------------------------
 // ENV
-// -------------------------
 const LIVEKIT_WS_URL = process.env.LIVEKIT_WS_URL || "(provided per request)";
 const ELEVENLABS_API_KEY = process.env.ELEVENLABS_API_KEY;
-
-// Simple toggle: true = play sine beep, false = use ElevenLabs TTS
-const USE_TEST_TONE = false;
+const TTS_MODE = process.env.TTS_MODE || "test"; // "test" | "elevenlabs"
 
 console.log("🚀 21AI Agent Worker booted");
 console.log("LIVEKIT_WS_URL:", LIVEKIT_WS_URL);
 console.log("ELEVENLABS_API_KEY:", ELEVENLABS_API_KEY ? "✓ set" : "❌ MISSING");
+console.log("TTS_MODE:", TTS_MODE);
 
 // Safety logs
 process.on("uncaughtException", (err) => {
@@ -41,23 +38,59 @@ process.on("unhandledRejection", (reason) => {
 });
 
 // ----------------------------------------------------
-// Audio constants
+// Audio constants (16 kHz mono PCM)
 // ----------------------------------------------------
-const SAMPLE_RATE = 16000;       // must match ElevenLabs PCM format
-const NUM_CHANNELS = 1;
-const FRAME_DURATION_MS = 20;    // 20ms per frame
-const SAMPLES_PER_FRAME = Math.floor(
-  (SAMPLE_RATE * FRAME_DURATION_MS) / 1000
-); // 320 samples @ 16kHz
 
-// Small helper
+const SAMPLE_RATE = 16000;
+const NUM_CHANNELS = 1;
+const FRAME_DURATION_MS = 20; // 20 ms
+const SAMPLES_PER_FRAME = Math.floor((SAMPLE_RATE * FRAME_DURATION_MS) / 1000); // 320 samples
+const BYTES_PER_SAMPLE = 2;
+const FRAME_SIZE_BYTES = SAMPLES_PER_FRAME * BYTES_PER_SAMPLE;
+
+// ----------------------------------------------------
+// Helper: sleep
+// ----------------------------------------------------
+
 function sleep(ms) {
   return new Promise((res) => setTimeout(res, ms));
 }
 
 // ----------------------------------------------------
-// ElevenLabs TTS → PCM 16kHz mono
+// INTERNAL TEST TONE (440 Hz sine, PCM 16-bit LE)
 // ----------------------------------------------------
+
+/**
+ * Generate a PCM 16-bit mono test tone (sine) at 440 Hz.
+ * Returns a Buffer containing raw PCM data at SAMPLE_RATE.
+ */
+function generateTestTonePcm(durationSeconds = 2, frequency = 440) {
+  const totalSamples = Math.floor(durationSeconds * SAMPLE_RATE);
+  const pcm = new Int16Array(totalSamples);
+
+  const amplitude = 0.25 * 32767; // avoid clipping
+  const twoPiFDivSR = (2 * Math.PI * frequency) / SAMPLE_RATE;
+
+  for (let i = 0; i < totalSamples; i++) {
+    const sample = Math.sin(twoPiFDivSR * i);
+    pcm[i] = Math.max(-32768, Math.min(32767, Math.floor(amplitude * sample)));
+  }
+
+  console.log("🎼 Generated test tone:", {
+    durationSeconds,
+    frequency,
+    totalSamples,
+    bytes: totalSamples * BYTES_PER_SAMPLE,
+  });
+
+  // Create a Buffer that exactly wraps the Int16Array
+  return Buffer.from(pcm.buffer, pcm.byteOffset, pcm.byteLength);
+}
+
+// ----------------------------------------------------
+// ElevenLabs TTS → PCM 16kHz mono (optional)
+// ----------------------------------------------------
+
 async function ttsElevenLabs(text) {
   try {
     if (!ELEVENLABS_API_KEY) {
@@ -65,10 +98,12 @@ async function ttsElevenLabs(text) {
       return null;
     }
 
-    const voiceId = "EXAVITQu4vr4xnSDxMaL"; // default voice
+    const voiceId = "EXAVITQu4vr4xnSDxMaL"; // Default voice
+
+    console.log("🗣 ElevenLabs TTS requested, text length:", text.length);
 
     const response = await fetch(
-      `https://api.elevenlabs.io/v1/text-to-speech/${voiceId}`,
+      `https://api.elevenlabs.io/v1/text-to-speech/${voiceId}/stream`,
       {
         method: "POST",
         headers: {
@@ -78,7 +113,8 @@ async function ttsElevenLabs(text) {
         body: JSON.stringify({
           text,
           model_id: "eleven_multilingual_v2",
-          output_format: "pcm_16000", // ← CRITICAL: raw PCM, 16kHz mono
+          // IMPORTANT: request PCM at 16 kHz mono
+          output_format: "pcm_16000",
           voice_settings: {
             stability: 0.4,
             similarity_boost: 0.8,
@@ -95,13 +131,20 @@ async function ttsElevenLabs(text) {
     const arrayBuf = await response.arrayBuffer();
     let buffer = Buffer.from(arrayBuf);
 
-    // Ensure even number of bytes (2 bytes per 16-bit sample)
+    // Ensure even length (2 bytes per sample)
     if (buffer.length % 2 !== 0) {
+      console.warn("⚠ ElevenLabs PCM odd-length buffer, trimming 1 byte");
       buffer = buffer.subarray(0, buffer.length - 1);
-      console.warn("⚠ Trimmed odd byte for alignment");
     }
 
-    console.log("🎧 PCM bytes from ElevenLabs:", buffer.length);
+    const totalSamples = buffer.length / BYTES_PER_SAMPLE;
+
+    console.log("🎧 ElevenLabs PCM stats:", {
+      bytes: buffer.length,
+      totalSamples,
+      sampleRate: SAMPLE_RATE,
+    });
+
     return buffer;
   } catch (err) {
     console.error("❌ ElevenLabs request error:", err);
@@ -110,90 +153,66 @@ async function ttsElevenLabs(text) {
 }
 
 // ----------------------------------------------------
-// Optional: generate a simple sine beep for testing
-// ----------------------------------------------------
-function generateSinePcm(durationMs = 1000, frequency = 440) {
-  const totalSamples = Math.floor((SAMPLE_RATE * durationMs) / 1000);
-  const pcm = new Int16Array(totalSamples);
-
-  const amplitude = 0.3 * 32767; // 30% to avoid clipping
-  const twoPiF = 2 * Math.PI * frequency;
-
-  for (let i = 0; i < totalSamples; i++) {
-    const t = i / SAMPLE_RATE;
-    pcm[i] = Math.round(Math.sin(twoPiF * t) * amplitude);
-  }
-
-  // Return as Buffer so we reuse playPcmAsFrames
-  return Buffer.from(pcm.buffer, pcm.byteOffset, pcm.byteLength);
-}
-
-// ----------------------------------------------------
 // PCM → LiveKit streaming
 // ----------------------------------------------------
+
 async function playPcmAsFrames(audioSource, pcmBuffer) {
   if (!pcmBuffer || pcmBuffer.length === 0) {
     console.warn("⚠ Empty PCM buffer");
     return;
   }
 
-  const totalSamples = pcmBuffer.length / 2; // 2 bytes per Int16 sample
-  const pcmView = new Int16Array(
-    pcmBuffer.buffer,
-    pcmBuffer.byteOffset,
-    totalSamples
-  );
-
-  console.log("🎧 Total samples:", totalSamples);
-  console.log("🎧 Samples per frame:", SAMPLES_PER_FRAME);
-  console.log(
-    "🎧 Approx total frames:",
-    Math.ceil(totalSamples / SAMPLES_PER_FRAME)
-  );
+  console.log("🎧 Streaming PCM to LiveKit:", {
+    totalBytes: pcmBuffer.length,
+    totalSamples: pcmBuffer.length / BYTES_PER_SAMPLE,
+    frameSizeBytes: FRAME_SIZE_BYTES,
+    samplesPerFrame: SAMPLES_PER_FRAME,
+    frames: Math.ceil(pcmBuffer.length / FRAME_SIZE_BYTES),
+  });
 
   let offset = 0;
 
-  while (offset < totalSamples) {
-    const remaining = totalSamples - offset;
-    const frameSamples = Math.min(SAMPLES_PER_FRAME, remaining);
+  while (offset < pcmBuffer.length) {
+    const endOffset = Math.min(offset + FRAME_SIZE_BYTES, pcmBuffer.length);
 
-    // Copy this frame’s samples into a new Int16Array
-    const frameData = new Int16Array(frameSamples);
-    for (let i = 0; i < frameSamples; i++) {
-      frameData[i] = pcmView[offset + i];
-    }
+    // Use subarray, NOT slice
+    const frameBytes = pcmBuffer.subarray(offset, endOffset);
+
+    const int16Data = new Int16Array(
+      frameBytes.buffer,
+      frameBytes.byteOffset,
+      frameBytes.length / BYTES_PER_SAMPLE
+    );
 
     const frame = new AudioFrame(
-      frameData,
+      int16Data,
       SAMPLE_RATE,
       NUM_CHANNELS,
-      frameSamples
+      int16Data.length // samples_per_channel
     );
 
     await audioSource.captureFrame(frame);
-    offset += frameSamples;
-
-    // Pace frames to real-time (~20ms per frame)
     await sleep(FRAME_DURATION_MS);
+    offset = endOffset;
   }
 
   console.log("📤 Finished streaming audio");
 }
 
 // ----------------------------------------------------
-// Agent join + greeting / test tone
+// Agent join + greeting
 // ----------------------------------------------------
-async function startAgent({ livekitUrl, roomName, agentId, agentToken, agentConfig }) {
+
+async function startAgent({ livekitUrl, roomName, agentId, agentToken }) {
   try {
     const identity = `agent_${agentId}_${Date.now()}`;
+
     console.log("🤖 Agent starting:", identity);
     console.log("🔗 LiveKit URL:", livekitUrl);
     console.log("🏷  Room name:", roomName);
-    console.log("🛡  Agent token present:", !!agentToken);
+    console.log("TTS_MODE:", TTS_MODE);
 
     const room = new Room();
-
-    // Connect to LiveKit room using agent token
     await room.connect(livekitUrl, agentToken);
     console.log("✅ Agent connected to room:", roomName);
 
@@ -203,13 +222,14 @@ async function startAgent({ livekitUrl, roomName, agentId, agentToken, agentConf
 
     room.on(RoomEvent.TrackSubscribed, (track, pub, participant) => {
       console.log("🎧 TrackSubscribed:", {
-        participant: participant.identity,
+        identity: participant.identity,
         kind: track.kind,
         source: pub.source,
+        trackSid: track.sid,
       });
     });
 
-    // Init audio publishing
+    // Init audio publishing at 16 kHz mono
     const audioSource = new AudioSource(SAMPLE_RATE, NUM_CHANNELS);
     const track = LocalAudioTrack.createAudioTrack("agent-audio", audioSource);
 
@@ -217,28 +237,29 @@ async function startAgent({ livekitUrl, roomName, agentId, agentToken, agentConf
     publishOptions.source = TrackSource.SOURCE_MICROPHONE;
 
     await room.localParticipant.publishTrack(track, publishOptions);
-    console.log("🔊 Agent audio track published");
+    console.log("🔊 Agent track published");
 
-    // --- Choose between test tone and real TTS ---
+    // ------------------------------------------------
+    // Choose audio source based on TTS_MODE
+    // ------------------------------------------------
+    let pcm;
 
-    if (USE_TEST_TONE) {
-      console.log("🔊 Playing TEST TONE (440Hz, 1s) instead of TTS...");
-      const pcm = generateSinePcm(1000, 440);
-      await playPcmAsFrames(audioSource, pcm);
-      console.log("✅ Test tone sent");
+    if (TTS_MODE === "test") {
+      console.log("🔬 Using INTERNAL TEST TONE for greeting (440 Hz)");
+      pcm = generateTestTonePcm(2, 440);
     } else {
       const greeting =
         "Hello, this is your Twenty One A I voice agent. How may I assist you today?";
-
-      const pcm = await ttsElevenLabs(greeting);
-      if (!pcm) {
-        console.warn("⚠ No PCM produced from ElevenLabs – skipping playback");
-        return;
-      }
-
-      await playPcmAsFrames(audioSource, pcm);
-      console.log("✅ Greeting sent");
+      pcm = await ttsElevenLabs(greeting);
     }
+
+    if (!pcm) {
+      console.warn("⚠ No PCM produced, nothing to stream");
+      return;
+    }
+
+    await playPcmAsFrames(audioSource, pcm);
+    console.log("✅ Greeting sent");
   } catch (err) {
     console.error("❌ Agent error:", err);
   }
@@ -247,70 +268,44 @@ async function startAgent({ livekitUrl, roomName, agentId, agentToken, agentConf
 // ----------------------------------------------------
 // Routes
 // ----------------------------------------------------
+
 app.get("/", (req, res) => {
   res.send("21AI Agent Worker is running ✅");
 });
 
 app.post("/start-session", async (req, res) => {
   try {
-    const {
-      livekitUrl,
-      roomName,
-      agentId,
-      agentToken,
-      agentConfig,
-      // passthrough keys from Supabase if needed:
-      livekitApiKey,
-      livekitApiSecret,
-      wsUrl,
-    } = req.body || {};
+    const { livekitUrl, roomName, agentId, agentToken } = req.body;
 
     console.log("⚡ /start-session payload:", {
       agentId,
       roomName,
       hasAgentToken: !!agentToken,
-      livekitUrl: livekitUrl || LIVEKIT_WS_URL,
-      hasAgentConfig: !!agentConfig,
-      voiceProvider: agentConfig?.voice?.provider,
-      voiceId: agentConfig?.voice?.voice_id,
+      livekitUrl,
     });
 
-    if (!livekitUrl && !LIVEKIT_WS_URL) {
-      return res.status(400).json({
-        ok: false,
-        error: "missing_livekit_url",
-      });
-    }
-
-    if (!roomName || !agentId) {
+    if (!livekitUrl || !roomName || !agentId) {
       return res.status(400).json({
         ok: false,
         error: "missing_fields",
-        received: { roomName, agentId },
+        received: req.body,
       });
     }
 
     if (!agentToken) {
-      console.error("❌ /start-session: agentToken missing – cannot start agent");
-      return res.status(400).json({
-        ok: false,
-        error: "missing_agent_token",
+      console.error(
+        "⚠ /start-session: agentToken missing – returning ok but NOT starting agent audio."
+      );
+      return res.json({
+        ok: true,
+        roomName,
+        agentId,
+        warning: "agentToken missing – agent not started",
       });
     }
 
-    const finalLivekitUrl = livekitUrl || LIVEKIT_WS_URL;
-
-    // Fire-and-forget start
-    startAgent({
-      livekitUrl: finalLivekitUrl,
-      roomName,
-      agentId,
-      agentToken,
-      agentConfig,
-      livekitApiKey,
-      livekitApiSecret,
-      wsUrl,
-    });
+    // Fire-and-forget
+    startAgent({ livekitUrl, roomName, agentId, agentToken });
 
     res.json({ ok: true, roomName, agentId });
   } catch (err) {
@@ -320,23 +315,24 @@ app.post("/start-session", async (req, res) => {
 });
 
 // ----------------------------------------------------
-// ElevenLabs Browser TTS Endpoint (MP3 for web UI)
+// ElevenLabs Browser TTS Endpoint (MP3 passthrough)
 // ----------------------------------------------------
+
 app.post("/tts", async (req, res) => {
   try {
-    const { text, voiceId } = req.body || {};
+    const { text, voiceId } = req.body;
 
     if (!text) {
       return res.status(400).json({ ok: false, error: "missing_text" });
     }
 
+    const finalVoiceId = voiceId || "EXAVITQu4vr4xnSDxMaL";
+
     if (!ELEVENLABS_API_KEY) {
       return res
         .status(500)
-        .json({ ok: false, error: "missing_elevenlabs_api_key" });
+        .json({ ok: false, error: "ELEVENLABS_API_KEY_missing" });
     }
-
-    const finalVoiceId = voiceId || "EXAVITQu4vr4xnSDxMaL";
 
     const response = await fetch(
       `https://api.elevenlabs.io/v1/text-to-speech/${finalVoiceId}`,
@@ -373,6 +369,7 @@ app.post("/tts", async (req, res) => {
 // ----------------------------------------------------
 // Start Server
 // ----------------------------------------------------
+
 app.listen(PORT, () => {
   console.log(`🚀 21AI Agent Worker listening on port ${PORT}`);
 });
