@@ -1,107 +1,120 @@
-// index.js
+// index.js  (21ai-agent-worker)
+
+// -------------------------
+// Imports & basic setup
+// -------------------------
 import express from "express";
 import cors from "cors";
+import dotenv from "dotenv";
+import fetch from "node-fetch"; // or axios if you prefer
+
+dotenv.config();
 
 const app = express();
-const PORT = process.env.PORT || 8080;
+const PORT = process.env.PORT || 3000;
 
+// -------------------------
+// Middleware
+// -------------------------
 app.use(cors());
 app.use(express.json());
 
-// Simple healthcheck
-app.get("/health", (req, res) => {
-  return res.json({ ok: true });
+// -------------------------
+// Health check
+// -------------------------
+app.get("/", (req, res) => {
+  res.json({ ok: true, service: "21ai-agent-worker" });
 });
 
-app.post("/start-session", (req, res) => {
+// -------------------------
+// Helper: validate payload
+// -------------------------
+const REQUIRED_FIELDS = ["agentId", "roomName", "livekitUrl", "agentConfig"];
+
+function validatePayload(body) {
+  const missing = REQUIRED_FIELDS.filter(
+    (field) => body[field] === undefined || body[field] === null
+  );
+  return missing;
+}
+
+// -------------------------
+// Main route: start agent
+// (You can change the path, but make sure your Python
+// code calls THIS exact path/URL.)
+// -------------------------
+app.post("/run-agent", async (req, res) => {
   try {
-    console.log("[worker] /start-session body:", JSON.stringify(req.body, null, 2));
+    const body = req.body || {};
 
-    const {
-      agentId,
-      roomName,
-      agentConfig = {},
-      agentToken,
-      livekitUrl,
-      livekit_url,
-      livekitApiKey,
-      livekitApiSecret,
-      livekit_api_key,
-      livekit_api_secret,
-      voice = {},
-    } = req.body;
-
-    // ---- basic validation ----
-    const missing = [];
-    if (!agentId) missing.push("agentId");
-    if (!roomName) missing.push("roomName");
-    if (!agentToken) missing.push("agentToken");
-
-    if (missing.length) {
-      console.error("[worker] missing required fields:", missing);
+    const missing = validatePayload(body);
+    if (missing.length > 0) {
       return res.status(400).json({
         error: "missing_fields",
         missing,
-        received: Object.keys(req.body),
+        received: Object.keys(body),
       });
     }
 
-    // Normalise LiveKit URL
-    const lkUrl =
-      livekitUrl ||
-      livekit_url ||
-      voice.livekitUrl ||
-      voice.livekit_url ||
-      process.env.LIVEKIT_URL;
+    const { agentId, roomName, livekitUrl, agentConfig } = body;
 
-    if (!lkUrl) {
-      console.error("[worker] missing livekit URL");
-      return res.status(400).json({
-        error: "missing_livekit_url",
-      });
-    }
-
-    // Normalise API keys (optional)
-    const lkApiKey =
-      livekitApiKey || livekit_api_key || process.env.LIVEKIT_API_KEY || null;
-    const lkApiSecret =
-      livekitApiSecret ||
-      livekit_api_secret ||
-      process.env.LIVEKIT_API_SECRET ||
-      null;
-
-    // ---- IMPORTANT: echo back config in a frontend-friendly shape ----
-    return res.json({
-      ok: true,
-
-      // core identifiers
+    console.log("🔵 Starting agent with payload:", {
       agentId,
       roomName,
+      livekitUrl,
+      hasAgentConfig: !!agentConfig,
+    });
 
-      // full config back to client
-      agentConfig,
+    // ----------------------------------------------------
+    // TODO: Your agent logic goes here.
+    // Example (pseudo-code):
+    //
+    // const response = await fetch(process.env.PIPECAT_URL, {
+    //   method: "POST",
+    //   headers: {
+    //     "Content-Type": "application/json",
+    //     Authorization: `Bearer ${process.env.PIPECAT_API_KEY}`,
+    //   },
+    //   body: JSON.stringify({
+    //     agentId,
+    //     roomName,
+    //     livekitUrl,
+    //     agentConfig,
+    //   }),
+    // });
+    //
+    // const result = await response.json();
+    // if (!response.ok) {
+    //   console.error("❌ Pipecat error:", result);
+    //   return res.status(500).json({ error: "pipecat_error", detail: result });
+    // }
+    //
+    // return res.json({ ok: true, result });
+    // ----------------------------------------------------
 
-      // token fields (give both names, in case frontend expects one)
-      token: agentToken,
-      agentToken,
-
-      // URL fields – AGAIN, give both
-      livekitUrl: lkUrl,
-      wsUrl: lkUrl,
-
-      // Optional keys
-      livekitApiKey: lkApiKey,
-      livekitApiSecret: lkApiSecret,
+    // Temporary stub so the route works even without Pipecat wired up:
+    return res.json({
+      ok: true,
+      message: "Agent worker received payload and would start LiveKit session here.",
+      debug: {
+        agentId,
+        roomName,
+        livekitUrl,
+        agentConfigKeys: Object.keys(agentConfig || {}),
+      },
     });
   } catch (err) {
-    console.error("[worker] Error in /start-session:", err);
+    console.error("🔥 Worker error:", err);
     return res.status(500).json({
       error: "internal_error",
-      message: err?.message ?? String(err),
+      detail: err?.message || String(err),
     });
   }
 });
 
+// -------------------------
+// Start server
+// -------------------------
 app.listen(PORT, () => {
-  console.log(`[worker] Dispatcher listening on port ${PORT}`);
+  console.log(`🚀 21ai-agent-worker listening on port ${PORT}`);
 });
