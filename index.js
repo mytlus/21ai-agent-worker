@@ -15,10 +15,7 @@ app.get("/health", (req, res) => {
 
 app.post("/start-session", (req, res) => {
   try {
-    console.log(
-      "[worker] /start-session body:",
-      JSON.stringify(req.body, null, 2)
-    );
+    console.log("[worker] /start-session body:", JSON.stringify(req.body, null, 2));
 
     const {
       agentId,
@@ -73,14 +70,26 @@ app.post("/start-session", (req, res) => {
       process.env.LIVEKIT_API_SECRET ||
       null;
 
-    // ---- Echo back config – client handles LiveKit side ----
+    // ---- IMPORTANT: echo back config in a frontend-friendly shape ----
     return res.json({
       ok: true,
+
+      // core identifiers
       agentId,
       roomName,
+
+      // full config back to client
       agentConfig,
+
+      // token fields (give both names, in case frontend expects one)
       token: agentToken,
+      agentToken,
+
+      // URL fields – AGAIN, give both
       livekitUrl: lkUrl,
+      wsUrl: lkUrl,
+
+      // Optional keys
       livekitApiKey: lkApiKey,
       livekitApiSecret: lkApiSecret,
     });
