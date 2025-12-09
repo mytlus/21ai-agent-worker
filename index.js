@@ -1,86 +1,95 @@
-// index.js — Node Worker (Railway)
-// PURPOSE: Dispatch a LiveKit Agent Job to join the room and speak
-
+// index.js
 import express from "express";
 import cors from "cors";
-import fetch from "node-fetch";
 
 const app = express();
+const PORT = process.env.PORT || 8080;
+
 app.use(cors());
 app.use(express.json());
 
-const PORT = process.env.PORT || 8080;
-const LIVEKIT_URL = process.env.LIVEKIT_URL; // e.g. https://twentyoneai-mjb9l6jc.livekit.cloud
-const LIVEKIT_API_KEY = process.env.LIVEKIT_API_KEY;
-const LIVEKIT_API_SECRET = process.env.LIVEKIT_API_SECRET;
-
-const base64 = (input) => Buffer.from(input).toString("base64");
-
-// -----------------------------------------------------------------------------
-// HEALTH
-// -----------------------------------------------------------------------------
+// Simple healthcheck
 app.get("/health", (req, res) => {
-  res.json({ ok: true, service: "21ai-agent-dispatcher" });
+  return res.json({ ok: true });
 });
 
-// -----------------------------------------------------------------------------
-// START SESSION → Dispatch agent job to LiveKit
-// -----------------------------------------------------------------------------
-app.post("/start-session", async (req, res) => {
-  console.log("[worker] Received start-session payload:", req.body);
-
-  const { agentId, roomName, agentConfig } = req.body;
-
-  if (!agentId || !roomName) {
-    return res.status(400).json({
-      ok: false,
-      error: "Missing agentId or roomName",
-    });
-  }
-
+app.post("/start-session", (req, res) => {
   try {
-    // -----------------------------------------------------------------------
-    // DISPATCH AGENT JOB TO LIVEKIT
-    // -----------------------------------------------------------------------
-    const dispatchUrl = `${LIVEKIT_URL}/agents/dispatch`;
+    console.log("[worker] /start-session body:", JSON.stringify(req.body, null, 2));
 
-    const authHeader = base64(`${LIVEKIT_API_KEY}:${LIVEKIT_API_SECRET}`);
-
-    const body = {
-      id: `job_${Date.now()}`,
+    const {
       agentId,
-      room: roomName,
-      metadata: {
-        systemPrompt: agentConfig?.systemPrompt ?? "",
-        model: agentConfig?.model ?? "gpt-4o-mini",
-        voice: agentConfig?.voice?.voice_id ?? "verse",
-      },
-    };
+      roomName,
+      agentConfig = {},
+      agentToken,
+      livekitUrl,
+      livekit_url,
+      livekitApiKey,
+      livekitApiSecret,
+      livekit_api_key,
+      livekit_api_secret,
+      voice = {},
+    } = req.body;
 
-    console.log("[worker] Dispatching job to LiveKit:", body);
+    // ---- basic validation ----
+    const missing = [];
+    if (!agentId) missing.push("agentId");
+    if (!roomName) missing.push("roomName");
+    if (!agentToken) missing.push("agentToken");
 
-    const response = await fetch(dispatchUrl, {
-      method: "POST",
-      headers: {
-        Authorization: `Basic ${authHeader}`,
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify(body),
+    if (missing.length) {
+      console.error("[worker] missing required fields:", missing);
+      return res.status(400).json({
+        error: "missing_fields",
+        missing,
+        received: Object.keys(req.body),
+      });
+    }
+
+    // Normalise LiveKit URL
+    const lkUrl =
+      livekitUrl ||
+      livekit_url ||
+      voice.livekitUrl ||
+      voice.livekit_url ||
+      process.env.LIVEKIT_URL;
+
+    if (!lkUrl) {
+      console.error("[worker] missing livekit URL");
+      return res.status(400).json({
+        error: "missing_livekit_url",
+      });
+    }
+
+    // Normalise API keys (optional – client may not need them)
+    const lkApiKey =
+      livekitApiKey || livekit_api_key || process.env.LIVEKIT_API_KEY || null;
+    const lkApiSecret =
+      livekitApiSecret ||
+      livekit_api_secret ||
+      process.env.LIVEKIT_API_SECRET ||
+      null;
+
+    // ---- IMPORTANT: just echo back config, no LiveKit server calls ----
+    return res.json({
+      ok: true,
+      agentId,
+      roomName,
+      agentConfig,
+      token: agentToken,
+      livekitUrl: lkUrl,
+      livekitApiKey: lkApiKey,
+      livekitApiSecret: lkApiSecret,
     });
-
-    const data = await response.json();
-    console.log("[worker] LiveKit dispatch response:", data);
-
-    return res.json({ ok: true, dispatched: true, livekitResponse: data });
   } catch (err) {
-    console.error("[worker] Error dispatching job:", err);
-    return res.status(500).json({ ok: false, error: "dispatch_failed" });
+    console.error("[worker] Error in /start-session:", err);
+    return res.status(500).json({
+      error: "internal_error",
+      message: err?.message ?? String(err),
+    });
   }
 });
 
-// -----------------------------------------------------------------------------
-// START SERVER
-// -----------------------------------------------------------------------------
-app.listen(PORT, () =>
-  console.log(`[worker] Dispatcher listening on port ${PORT}`)
-);
+app.listen(PORT, () => {
+  console.log(`[worker] Dispatcher listening on port ${PORT}`);
+});
