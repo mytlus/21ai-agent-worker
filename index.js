@@ -1,120 +1,99 @@
-// index.js  (21ai-agent-worker)
-
-// -------------------------
-// Imports & basic setup
-// -------------------------
 import express from "express";
 import cors from "cors";
 import dotenv from "dotenv";
-import fetch from "node-fetch"; // or axios if you prefer
+import axios from "axios";
 
 dotenv.config();
 
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// -------------------------
-// Middleware
-// -------------------------
+// URL of your Python service on Railway, e.g.
+// https://21ai-python-agent.up.railway.app
+const PYTHON_AGENT_URL = process.env.PYTHON_AGENT_URL;
+
+if (!PYTHON_AGENT_URL) {
+  console.warn(
+    "[worker] WARNING: PYTHON_AGENT_URL is not set. Set it in Railway env."
+  );
+}
+
 app.use(cors());
 app.use(express.json());
 
-// -------------------------
-// Health check
-// -------------------------
+// Simple health check
 app.get("/", (req, res) => {
-  res.json({ ok: true, service: "21ai-agent-worker" });
+  return res.json({ ok: true, service: "21ai-agent-worker" });
 });
 
-// -------------------------
-// Helper: validate payload
-// -------------------------
-const REQUIRED_FIELDS = ["agentId", "roomName", "livekitUrl", "agentConfig"];
+app.post("/start", async (req, res) => {
+  const body = req.body || {};
+  const { agentId, roomName, livekitUrl, agentConfig } = body;
 
-function validatePayload(body) {
-  const missing = REQUIRED_FIELDS.filter(
-    (field) => body[field] === undefined || body[field] === null
-  );
-  return missing;
-}
+  // 🔎 Minimal validation (this is where "missing_fields" was coming from before)
+  const missing = [];
+  if (!agentId) missing.push("agentId");
+  if (!roomName) missing.push("roomName");
+  if (!agentConfig) missing.push("agentConfig");
+  if (!agentConfig?.agentToken) missing.push("agentConfig.agentToken");
 
-// -------------------------
-// Main route: start agent
-// (You can change the path, but make sure your Python
-// code calls THIS exact path/URL.)
-// -------------------------
-app.post("/run-agent", async (req, res) => {
+  if (missing.length > 0) {
+    console.error("[worker] missing required fields:", missing);
+    return res.status(400).json({
+      error: "missing_fields",
+      missing,
+      received: body,
+    });
+  }
+
+  if (!PYTHON_AGENT_URL) {
+    return res.status(500).json({
+      error: "PYTHON_AGENT_URL_not_set",
+    });
+  }
+
+  const payloadForPython = {
+    agentId,
+    roomName,
+    livekitUrl: livekitUrl || process.env.LIVEKIT_URL || null,
+    agentConfig: {
+      agentToken: agentConfig.agentToken,
+      systemPrompt:
+        agentConfig.systemPrompt ||
+        "You are a friendly receptionist for a small business.",
+      model: agentConfig.model || "gpt-4o-mini",
+      voiceId: agentConfig.voiceId || "alloy",
+    },
+  };
+
+  console.log("[worker] Forwarding payload to python:", payloadForPython);
+
   try {
-    const body = req.body || {};
-
-    const missing = validatePayload(body);
-    if (missing.length > 0) {
-      return res.status(400).json({
-        error: "missing_fields",
-        missing,
-        received: Object.keys(body),
-      });
-    }
-
-    const { agentId, roomName, livekitUrl, agentConfig } = body;
-
-    console.log("🔵 Starting agent with payload:", {
-      agentId,
-      roomName,
-      livekitUrl,
-      hasAgentConfig: !!agentConfig,
+    const url = `${PYTHON_AGENT_URL}/run-agent`;
+    const resp = await axios.post(url, payloadForPython, {
+      timeout: 10_000,
     });
 
-    // ----------------------------------------------------
-    // TODO: Your agent logic goes here.
-    // Example (pseudo-code):
-    //
-    // const response = await fetch(process.env.PIPECAT_URL, {
-    //   method: "POST",
-    //   headers: {
-    //     "Content-Type": "application/json",
-    //     Authorization: `Bearer ${process.env.PIPECAT_API_KEY}`,
-    //   },
-    //   body: JSON.stringify({
-    //     agentId,
-    //     roomName,
-    //     livekitUrl,
-    //     agentConfig,
-    //   }),
-    // });
-    //
-    // const result = await response.json();
-    // if (!response.ok) {
-    //   console.error("❌ Pipecat error:", result);
-    //   return res.status(500).json({ error: "pipecat_error", detail: result });
-    // }
-    //
-    // return res.json({ ok: true, result });
-    // ----------------------------------------------------
+    console.log("[worker] Python service response:", resp.data);
 
-    // Temporary stub so the route works even without Pipecat wired up:
     return res.json({
       ok: true,
-      message: "Agent worker received payload and would start LiveKit session here.",
-      debug: {
-        agentId,
-        roomName,
-        livekitUrl,
-        agentConfigKeys: Object.keys(agentConfig || {}),
-      },
+      from: "21ai-agent-worker",
+      pythonResponse: resp.data,
     });
   } catch (err) {
-    console.error("🔥 Worker error:", err);
-    return res.status(500).json({
-      error: "internal_error",
-      detail: err?.message || String(err),
+    console.error("[worker] Error calling python agent:", err.message);
+
+    const status = err.response?.status || 500;
+    const data = err.response?.data || { error: "unknown_error" };
+
+    return res.status(status).json({
+      error: "python_agent_error",
+      detail: data,
     });
   }
 });
 
-// -------------------------
-// Start server
-// -------------------------
 app.listen(PORT, () => {
-  console.log(`🚀 21ai-agent-worker listening on port ${PORT}`);
+  console.log(`[worker] 21ai-agent-worker listening on port ${PORT}`);
 });
