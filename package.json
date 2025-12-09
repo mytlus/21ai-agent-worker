@@ -1,6 +1,7 @@
 {
   "name": "21ai-agent-worker",
-  "version": "1.0.2",
+  "version": "1.0.0",
+  "private": true,
   "type": "module",
   "main": "index.js",
   "scripts": {
@@ -9,7 +10,8 @@
   "dependencies": {
     "express": "^4.19.2",
     "cors": "^2.8.5",
-    "dotenv": "^16.4.5"
-    "node-fetch": "^3.3.2"
+    "node-fetch": "^3.3.2",
+    "@livekit/agents": "^0.10.4",
+    "ws": "^8.18.0"
   }
 }
