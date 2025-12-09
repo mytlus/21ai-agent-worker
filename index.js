@@ -1,6 +1,7 @@
 // index.js
 import express from "express";
 import cors from "cors";
+import { Agent, LiveKitTransport } from "@livekit/agents";
 
 const app = express();
 const PORT = process.env.PORT || 8080;
@@ -13,9 +14,52 @@ app.get("/health", (req, res) => {
   return res.json({ ok: true });
 });
 
-app.post("/start-session", (req, res) => {
+// ---- LiveKit agent runner ----
+async function runAgentSession(agentToken, roomName, agentConfig = {}, livekitUrl) {
+  console.log("[worker] Starting agent session…");
+
   try {
-    console.log("[worker] /start-session body:", JSON.stringify(req.body, null, 2));
+    // 1 — Create LiveKit transport
+    const transport = await LiveKitTransport.create({
+      url: livekitUrl,
+      token: agentToken,
+      room: {
+        autoSubscribe: true,
+      },
+    });
+
+    console.log("[worker] Connected to LiveKit room:", roomName);
+
+    // 2 — Create an AI Agent instance
+    const agent = new Agent({
+      transport,
+      model: {
+        provider: "openai",
+        model: agentConfig?.model || "gpt-4o-mini",
+        systemPrompt:
+          agentConfig?.systemPrompt || "You are a helpful assistant.",
+      },
+      voice: {
+        provider: "openai",
+        voiceId: agentConfig?.voice?.voice_id || "verse",
+      },
+    });
+
+    // 3 — Start the agent realtime loop
+    await agent.start();
+    console.log("[worker] Agent started and publishing audio.");
+  } catch (err) {
+    console.error("[worker] ERROR in runAgentSession:", err);
+  }
+}
+
+// ---- HTTP endpoint ----
+app.post("/start-session", async (req, res) => {
+  try {
+    console.log(
+      "[worker] /start-session body:",
+      JSON.stringify(req.body, null, 2)
+    );
 
     const {
       agentId,
@@ -61,7 +105,7 @@ app.post("/start-session", (req, res) => {
       });
     }
 
-    // Normalise API keys (optional – client may not need them)
+    // Normalise API keys (if you ever need them on server side)
     const lkApiKey =
       livekitApiKey || livekit_api_key || process.env.LIVEKIT_API_KEY || null;
     const lkApiSecret =
@@ -70,16 +114,20 @@ app.post("/start-session", (req, res) => {
       process.env.LIVEKIT_API_SECRET ||
       null;
 
-    // ---- IMPORTANT: just echo back config, no LiveKit server calls ----
+    // (Optional) log that we resolved them, but **never** log actual secrets
+    if (lkApiKey) console.log("[worker] LiveKit API key available (server-side).");
+
+    // ---- Start agent session (do NOT await, so HTTP returns immediately) ----
+    runAgentSession(agentToken, roomName, agentConfig, lkUrl).catch((err) =>
+      console.error("[worker] runAgentSession top-level error:", err)
+    );
+
+    // ---- Respond to client (no secrets) ----
     return res.json({
       ok: true,
       agentId,
       roomName,
-      agentConfig,
-      token: agentToken,
       livekitUrl: lkUrl,
-      livekitApiKey: lkApiKey,
-      livekitApiSecret: lkApiSecret,
     });
   } catch (err) {
     console.error("[worker] Error in /start-session:", err);
@@ -90,6 +138,7 @@ app.post("/start-session", (req, res) => {
   }
 });
 
+// ---- Start HTTP server ----
 app.listen(PORT, () => {
   console.log(`[worker] Dispatcher listening on port ${PORT}`);
 });
