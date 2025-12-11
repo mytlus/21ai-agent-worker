@@ -1,5 +1,4 @@
 import express from "express";
-import type { Request, Response } from "express";
 
 const app = express();
 app.use(express.json());
@@ -11,12 +10,16 @@ const PYTHON_AGENT_URL =
   process.env.PYTHON_AGENT_URL ||
   "https://21ai-python-agent-production.up.railway.app";
 
-app.get("/health", (_req: Request, res: Response) => {
+app.get("/", (req, res) => {
+  res.json({ ok: true, service: "21ai-agent-worker-root" });
+});
+
+app.get("/health", (req, res) => {
   console.log("[worker] /health check");
   res.json({ status: "ok", service: "21ai-agent-worker" });
 });
 
-app.post("/start-session", async (req: Request, res: Response) => {
+app.post("/start-session", async (req, res) => {
   console.log("[worker] /start-session incoming:", JSON.stringify(req.body));
 
   try {
@@ -26,9 +29,12 @@ app.post("/start-session", async (req: Request, res: Response) => {
       body: JSON.stringify(req.body),
     });
 
-    const data = await resp
-      .json()
-      .catch(() => ({ ok: false, error: "non_json_response" }));
+    let data = null;
+    try {
+      data = await resp.json();
+    } catch (e) {
+      data = { ok: false, error: "non_json_response" };
+    }
 
     console.log(
       "[worker] Python /start response:",
