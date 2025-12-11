@@ -1,5 +1,8 @@
-import express from "express";
+// index.js - 21ai agent worker (no TypeScript, pure JS)
 
+const express = require("express");
+
+// Node 18+ has global fetch, so we don't need node-fetch
 const app = express();
 app.use(express.json());
 
@@ -10,6 +13,9 @@ const PYTHON_AGENT_URL =
   process.env.PYTHON_AGENT_URL ||
   "https://21ai-python-agent-production.up.railway.app";
 
+// -----------------------------------------------------------------------------
+// Root + Health
+// -----------------------------------------------------------------------------
 app.get("/", (req, res) => {
   res.json({ ok: true, service: "21ai-agent-worker-root" });
 });
@@ -19,6 +25,9 @@ app.get("/health", (req, res) => {
   res.json({ status: "ok", service: "21ai-agent-worker" });
 });
 
+// -----------------------------------------------------------------------------
+// LiveKit /start-session → forward to Python /start
+// -----------------------------------------------------------------------------
 app.post("/start-session", async (req, res) => {
   console.log("[worker] /start-session incoming:", JSON.stringify(req.body));
 
@@ -29,7 +38,7 @@ app.post("/start-session", async (req, res) => {
       body: JSON.stringify(req.body),
     });
 
-    let data = null;
+    let data;
     try {
       data = await resp.json();
     } catch (e) {
@@ -45,7 +54,7 @@ app.post("/start-session", async (req, res) => {
     console.error("[worker] Error calling Python /start:", err);
   }
 
-  // Always ACK quickly to LiveKit
+  // Always ACK LiveKit quickly
   res.json({ ok: true });
 });
 
